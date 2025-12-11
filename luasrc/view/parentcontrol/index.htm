@@ -1,0 +1,25 @@
+<% include("cbi/map") %>
+<script type="text/javascript">
+//<![CDATA[
+    XHR.poll(2, '<%=luci.dispatcher.build_url("admin", "control", "parentcontrol", "status")%>', null,
+        function (x, result) {
+            var status = document.getElementsByClassName('parentcontrol_status')[0];
+            status.style.fontWeight = "bold";
+
+            if (result.status == "inactive") {
+                status.style.color = "red";
+                status.innerHTML = '<%=translate("NOT RUNNING")%>';
+            } else if (result.status == "started_no_rules") {
+                status.style.color = "orange";
+                status.innerHTML = '<%=translate("STARTED (NO RULES)")%>';
+            } else if (result.status == "running") {
+                status.style.color = "green";
+                status.innerHTML = '<%=translate("RUNNING")%>';
+            } else {
+                status.style.color = "gray";
+                status.innerHTML = '<%=translate("UNKNOWN")%>';
+            }
+        }
+    )
+//]]>
+</script>
