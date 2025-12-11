@@ -4,7 +4,7 @@ local ipc = require "luci.ip"
 local net = require "luci.model.network".init()
 local sys = require "luci.sys"
 local a, t, e
-a = Map("parentcontrol", translate("Parent Control"), translate("<b><font color=\"green\">利用iptables来管控数据包过滤以禁止符合设定条件的用户连接互联网的工具软件。</font> </b></br>\
+a = Map("parentcontrol", translate("Parent Control"), translate("<b><font color=\"green\">利用 crontab 来管控以禁止符合设定条件的用户连接互联网的工具软件。</font> </b></br>\
 时间限制:限制指定MAC地址机器是否联网.包括IPV4和IPV6</br>不指定MAC就是代表限制所有机器,星期用1-7表示，多个日期用自定义：1,5表示星期一和星期五" ))
 a.template = "parentcontrol/index"
 

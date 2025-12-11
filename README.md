@@ -13,8 +13,7 @@
 
 最初版本参考Lienol大的网址过滤源码和参考部分网上开源代码而来。
 
-参考来源：
-https://github.com/Lienol/openwrt-package/tree/main/luci-app-control-weburl
+参考来源：[点此访问](https://github.com/Lienol/openwrt-package/tree/main/luci-app-control-weburl)
 
 ## 界面
 
@@ -23,6 +22,10 @@ https://github.com/Lienol/openwrt-package/tree/main/luci-app-control-weburl
 ![screenshots](./doc/parentcontrol2.png)
 
 ![screenshots](./doc/parentcontrol3.png)
+
+## 重写目的
+
+换了路由器并刷入了ImmortalWrt，但没有找到合适的这种相关软件，并且大部分都是iptables，与firewall4不兼容，于是自己修改一个自用
 
 ## 改进内容
 
