@@ -29,17 +29,10 @@
 
 ## 改进内容
 
-1.使用自定义系统 crontab 中的计划任务来管理，去除iptables
-2.后期会修改网址过滤与协议过滤功能
+使用自定义系统 crontab 中的计划任务来管理，去除iptables
 
 - [x] crontab时间控制
-- [] 网址过滤修改
-- [] 协议过滤修改
 
 ## 修改后界面
 
 ![screenshots](./Pictures/1.png)
-
-![screenshots](./Pictures/2.png)
-
-![screenshots](./Pictures/3.png)

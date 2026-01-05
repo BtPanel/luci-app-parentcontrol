@@ -7,13 +7,11 @@ LOG_DIR=/tmp/parentcontrol
 LOG_FILE=$LOG_DIR/$CONFIG.log
 LOCK=/tmp/lock/${CONFIG}.lock
 nft=$(command -v nft)
-DNSMASQ_CONF_DIR=/tmp/dnsmasq.d
-DNS_CONF=$DNSMASQ_CONF_DIR/parentcontrol.conf
 TIME_FILTER=0
 NOW_MIN=0
 NOW_WEEK=0
 
-EXTRA_COMMANDS="block_time unblock_time block_protocol unblock_protocol block_weburl unblock_weburl"
+EXTRA_COMMANDS="block_time unblock_time block_speed unblock_speed"
 
 elog() {
     mkdir -p "$LOG_DIR"
@@ -71,7 +69,7 @@ time_match() {
 # 生成/重建 cron：根据 time sections 写定时 block/unblock
 rebuild_cron() {
     # 先移除旧的 parentcontrol 条目
-    sed -i '/# parentcontrol$/d;/\/etc\/init\.d\/parentcontrol \(\<block_time\>\|\<unblock_time\>\|\<block_protocol\>\|\<unblock_protocol\>\|\<block_weburl\>\|\<unblock_weburl\>\)/d' /etc/crontabs/root 2>/dev/null
+    sed -i '/# parentcontrol$/d;/\/etc\/init\.d\/parentcontrol \(\<block_time\>\|\<unblock_time\>\|\<block_speed\>\|\<unblock_speed\>\)/d' /etc/crontabs/root 2>/dev/null
 
     cron_add() {
         local hhmm="$1"; local week="$2"; local cmd="$3"
@@ -80,7 +78,7 @@ rebuild_cron() {
     }
 
     # 根据各 section 的 timestart/timeend 生成 cron
-    for mode in time protocol weburl; do
+    for mode in time speed; do
         for i in $(uci show "$CONFIG" | grep "=${mode}" | cut -d'[' -f2 | cut -d']' -f1); do
             local enabled start end week
             enabled=$(uci -q get $CONFIG.@$mode[$i].enable)
@@ -110,11 +108,7 @@ set_rules() {
     $nft add table inet fw4 2>/dev/null || true
     case "$mmode" in
         time)     $nft add chain inet fw4 parentcontrol_time 2>/dev/null || true ;;
-        protocol) $nft add chain inet fw4 parentcontrol_protocol 2>/dev/null || true ;;
-        weburl)
-            $nft add chain inet fw4 parentcontrol_weburl 2>/dev/null || true
-            $nft add chain inet fw4 parentcontrol_weburl_nat 2>/dev/null || true
-        ;;
+        speed)    $nft add chain inet fw4 parentcontrol_speed 2>/dev/null || true ;;
     esac
 
     # 挂载 jump 到 base chain（显式插入到链首，避免被后续 ACCEPT 提前放行）
@@ -123,15 +117,9 @@ set_rules() {
             $nft insert rule inet fw4 forward position 0 jump parentcontrol_time 2>/dev/null || \
                 $nft add rule inet fw4 forward jump parentcontrol_time 2>/dev/null
         ;;
-        protocol)
-            $nft insert rule inet fw4 forward position 0 jump parentcontrol_protocol 2>/dev/null || \
-                $nft add rule inet fw4 forward jump parentcontrol_protocol 2>/dev/null
-        ;;
-        weburl)
-            $nft insert rule inet fw4 forward position 0 jump parentcontrol_weburl 2>/dev/null || \
-                $nft add rule inet fw4 forward jump parentcontrol_weburl 2>/dev/null
-            $nft insert rule inet fw4 prerouting position 0 jump parentcontrol_weburl_nat 2>/dev/null || \
-                $nft add rule inet fw4 prerouting jump parentcontrol_weburl_nat 2>/dev/null
+        speed)
+            $nft insert rule inet fw4 forward position 0 jump parentcontrol_speed 2>/dev/null || \
+                $nft add rule inet fw4 forward jump parentcontrol_speed 2>/dev/null
         ;;
     esac
 
@@ -169,81 +157,18 @@ set_rules() {
                 $nft add rule inet fw4 parentcontrol_time $INF_EXPR $MAC_EXPR counter reject 2>/dev/null
                 elog "time-chain rule loaded: mac=$mac timed_only=$timed_only"
             ;;
-            protocol)
-                proto=$(uci -q get $CONFIG.@$mmode[$i].proto); [ -z "$proto" ] && proto="tcp"
-                ports=$(uci -q get $CONFIG.@$mmode[$i].ports)
-                dports=$(uci -q get $CONFIG.@$mmode[$i].portd)
-
-                [ -n "$ports" ] && $nft add rule inet fw4 parentcontrol_protocol $MAC_EXPR $proto sport { $ports } counter reject 2>/dev/null
-                [ -n "$dports" ] && $nft add rule inet fw4 parentcontrol_protocol $MAC_EXPR $proto dport { $dports } counter reject 2>/dev/null
-                elog "protocol-chain rule loaded: mac=$mac proto=$proto sport=$ports dport=$dports timed_only=$timed_only"
-            ;;
-            weburl)
-                # DNS 层方案：黑洞域名 + 强制 DNS 走路由器（含 DoT 阻断）
-                lan_if=$(uci -q get network.lan.device)
-                [ -z "$lan_if" ] && lan_if=$(uci -q get network.lan.ifname)
-                [ -z "$lan_if" ] && lan_if="br-lan"
-                router_ip=$(uci -q get network.lan.ipaddr)
-                [ -z "$router_ip" ] && router_ip="192.168.1.1"
-
-                # filter：丢弃 DoT；丢弃直连外部 DNS（IPv4/IPv6）
-                $nft add rule inet fw4 parentcontrol_weburl $MAC_EXPR meta nfproto ipv4 udp dport 53 ip daddr != $router_ip counter drop 2>/dev/null
-                $nft add rule inet fw4 parentcontrol_weburl $MAC_EXPR meta nfproto ipv6 udp dport 53 counter drop 2>/dev/null
-                $nft add rule inet fw4 parentcontrol_weburl $MAC_EXPR tcp dport 853 counter drop 2>/dev/null
-
-                # nat：把该 MAC 的 DNS 请求强制转发到路由器（仅 IPv4）
-                $nft add rule inet fw4 parentcontrol_weburl_nat meta nfproto ipv4 iifname "$lan_if" $MAC_EXPR udp dport 53 dnat to $router_ip counter 2>/dev/null
-                $nft add rule inet fw4 parentcontrol_weburl_nat meta nfproto ipv4 iifname "$lan_if" $MAC_EXPR tcp dport 53 dnat to $router_ip counter 2>/dev/null
-
-                elog "weburl-chain rule loaded: mac=$mac (DNS redirect + DoT drop) timed_only=$timed_only"
+            speed)
+                rate=$(uci -q get $CONFIG.@$mmode[$i].rate); [ -z "$rate" ] && rate="1mbit"
+                # 限速规则：超过速率则 drop
+                $nft add rule inet fw4 parentcontrol_speed $MAC_EXPR limit rate $rate counter drop 2>/dev/null
+                elog "speed-chain rule loaded: mac=$mac rate=$rate timed_only=$timed_only"
             ;;
         esac
     done
-}
-
-build_dns_blacklist() {
-    timed_only=$1
-
-    mkdir -p "$DNSMASQ_CONF_DIR"
-    : > "$DNS_CONF"
-
-    idx=0
-    for i in $(uci show "$CONFIG" | grep "=weburl" | cut -d'[' -f2 | cut -d']' -f1); do
-        enabled=$(uci -q get $CONFIG.@weburl[$i].enable)
-        [ "x$enabled" != "x1" ] && continue
-
-        start=$(uci -q get $CONFIG.@weburl[$i].timestart)
-        stop=$(uci -q get $CONFIG.@weburl[$i].timeend)
-        week=$(uci -q get $CONFIG.@weburl[$i].week)
-        case "$timed_only" in
-            1)  [ -z "$start" ] && [ -z "$stop" ] && continue ;;
-            0)  if [ -n "$start" ] || [ -n "$stop" ]; then continue; fi ;;
-        esac
-
-        if [ "$TIME_FILTER" = "1" ] && [ "$timed_only" = "1" ]; then
-            time_match "$start" "$stop" "$week" "$NOW_MIN" "$NOW_WEEK" || continue
-        fi
-
-        mac=$(uci -q get $CONFIG.@weburl[$i].mac)
-        ipaddr=$(uci -q get $CONFIG.@weburl[$i].ip)
-        domain=$(uci -q get $CONFIG.@weburl[$i].word)
-        [ -z "$mac" ] && continue
-        [ -z "$domain" ] && continue
-
-        tag="pcw_$idx"
-        echo "dhcp-mac=set:$tag,$mac" >> "$DNS_CONF"
-        [ -n "$ipaddr" ] && echo "dhcp-host=$mac,$ipaddr,set:$tag" >> "$DNS_CONF"
-        echo "address=/$domain/0.0.0.0/tag:$tag" >> "$DNS_CONF"
-        echo "address=/$domain/::/tag:$tag" >> "$DNS_CONF"
-        idx=$((idx+1))
-    done
-
-    /etc/init.d/dnsmasq reload >/dev/null 2>&1
-    elog "dns blacklist rebuilt (timed_only=$timed_only)"
 }
 
 del_rule() {
-    for ch in parentcontrol_time parentcontrol_protocol parentcontrol_weburl parentcontrol_weburl_nat; do
+    for ch in parentcontrol_time parentcontrol_speed; do
         $nft flush chain inet fw4 $ch 2>/dev/null
         $nft delete chain inet fw4 $ch 2>/dev/null
     done
@@ -282,51 +207,17 @@ unblock_time() {
     # 注意：不删除 LOCK，让整体服务仍视为“启动”状态
 }
 
-block_protocol() {
-    $nft flush chain inet fw4 parentcontrol_protocol 2>/dev/null
-    set_rules protocol 0
-    set_rules protocol 1
-    elog "cron: block_protocol executed (timed protocol rules active)"
+block_speed() {
+    $nft flush chain inet fw4 parentcontrol_speed 2>/dev/null
+    set_rules speed 0
+    set_rules speed 1
+    elog "cron: block_speed executed (speed rules active)"
 }
 
-unblock_protocol() {
-    $nft flush chain inet fw4 parentcontrol_protocol 2>/dev/null
-    set_rules protocol 0
-    elog "cron: unblock_protocol executed (timed protocol rules removed, always rules kept)"
-}
-
-block_weburl() {
-    $nft flush chain inet fw4 parentcontrol_weburl 2>/dev/null
-    $nft flush chain inet fw4 parentcontrol_weburl_nat 2>/dev/null
-    NOW_H=$(date +%H | sed 's/^0*//'); NOW_M=$(date +%M | sed 's/^0*//')
-    [ -z "$NOW_H" ] && NOW_H=0; [ -z "$NOW_M" ] && NOW_M=0
-    NOW_MIN=$((NOW_H*60 + NOW_M))
-    NOW_WEEK=$(date +%w); [ "$NOW_WEEK" = "0" ] && NOW_WEEK=7
-    TIME_FILTER=1
-    set_rules weburl 0
-    set_rules weburl 1   # 仅加载当前时间窗口内的定时条目
-    build_dns_blacklist ""   # 按 MAC 生成 tag 限定的 address 规则
-    TIME_FILTER=0
-    # 刷新连接，避免已建立 DNS/DoH 连接穿透
-    if command -v conntrack >/dev/null 2>&1; then
-        conntrack -F 2>/dev/null
-    fi
-    elog "cron: block_weburl executed (timed weburl rules active)"
-}
-
-unblock_weburl() {
-    $nft flush chain inet fw4 parentcontrol_weburl 2>/dev/null
-    $nft flush chain inet fw4 parentcontrol_weburl_nat 2>/dev/null
-    NOW_H=$(date +%H | sed 's/^0*//'); NOW_M=$(date +%M | sed 's/^0*//')
-    [ -z "$NOW_H" ] && NOW_H=0; [ -z "$NOW_M" ] && NOW_M=0
-    NOW_MIN=$((NOW_H*60 + NOW_M))
-    NOW_WEEK=$(date +%w); [ "$NOW_WEEK" = "0" ] && NOW_WEEK=7
-    TIME_FILTER=1
-    set_rules weburl 0
-    set_rules weburl 1   # 仅加载当前时间窗口内的定时条目
-    build_dns_blacklist 0
-    TIME_FILTER=0
-    elog "cron: unblock_weburl executed (timed weburl rules removed, always rules kept)"
+unblock_speed() {
+    $nft flush chain inet fw4 parentcontrol_speed 2>/dev/null
+    set_rules speed 0
+    elog "cron: unblock_speed executed (timed speed rules removed, always rules kept)"
 }
 
 start() {
@@ -345,10 +236,8 @@ start() {
     # 统计启用条目
     allsum=$(grep -c "enable='1'" /etc/config/$CONFIG)
     if [ "$allsum" -gt 0 ]; then
-        set_rules protocol 0
-        set_rules weburl 0
         set_rules time 0
-        build_dns_blacklist 0
+        set_rules speed 0
         elog "rules loaded according to config (enabled sections=$allsum; timed rules wait cron)"
     else
         elog "no enabled sections; started without active rules"
@@ -364,9 +253,7 @@ stop() {
     # 彻底关闭：删链、删 lock、删 cron
     del_rule
     rm -f "$LOCK" 2>/dev/null
-    sed -i '/# parentcontrol$/d;/\/etc\/init\.d\/parentcontrol \(\<block_time\>\|\<unblock_time\>\|\<block_protocol\>\|\<unblock_protocol\>\|\<block_weburl\>\|\<unblock_weburl\>\)/d' /etc/crontabs/root 2>/dev/null
-    rm -f "$DNS_CONF" 2>/dev/null
-    /etc/init.d/dnsmasq reload >/dev/null 2>&1
+    sed -i '/# parentcontrol$/d;/\/etc\/init\.d\/parentcontrol \(\<block_time\>\|\<unblock_time\>\|\<block_speed\>\|\<unblock_speed\>\)/d' /etc/crontabs/root 2>/dev/null
     /etc/init.d/cron restart
     elog "parentcontrol service stopped (rules/chains/cron cleared)"
 }
@@ -377,8 +264,7 @@ reload() {
     if [ "$enabled" = "1" ]; then
         start
         # 立即激活规则（含定时条目），避免需手动 block_*
-        block_protocol
-        block_weburl
+        block_speed
         block_time
     else
         stop
@@ -402,8 +288,7 @@ status() {
 
     # 3. 有链 → running
     if $nft list chain inet fw4 parentcontrol_time >/dev/null 2>&1 || \
-       $nft list chain inet fw4 parentcontrol_protocol >/dev/null 2>&1 || \
-       $nft list chain inet fw4 parentcontrol_weburl >/dev/null 2>&1; then
+       $nft list chain inet fw4 parentcontrol_speed >/dev/null 2>&1; then
         echo "parentcontrol is running (rules active)"
         return 0
     fi

@@ -9,8 +9,6 @@ function index()
     e.acl_depends = { "luci-app-parentcontrol" }
 
     entry({"admin","control","parentcontrol","time"}, cbi("parentcontrol/time"), _("Time Control"), 1).leaf = true
-    entry({"admin","control","parentcontrol","weburl"}, cbi("parentcontrol/weburl"), _("Weburl Control"), 20).leaf = true
-    entry({"admin","control","parentcontrol","protocol"}, cbi("parentcontrol/protocol"), _("Protocol Control"), 30).leaf = true
     entry({"admin","control","parentcontrol","status"}, call("status")).leaf = true
 end
 

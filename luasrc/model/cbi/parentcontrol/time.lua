@@ -76,6 +76,50 @@ week:value(5,translate("Friday"))
 week:value(6,translate("Saturday"))
 week.default='*'
 
+t = a:section(TypedSection, "speed", translate("速度限制列表"))
+t.template = "cbi/tblsection"
+t.anonymous = true
+t.addremove = true
+
+e = t:option(Value, 'remarks', translate('Remarks'))
+
+e = t:option(Flag, "enable", translate("开启"))
+e.rmempty = false
+e.default = '1'
+
+e = t:option(Value, "mac", translate("MAC地址<font color=\"green\">(留空为全部客户端)</font>"))
+e.rmempty = true
+o.net.mac_hints(function(t, a) e:value(t, "%s (%s)" % {t, a}) end)
+
+e = t:option(Value, "rate", translate("限速速率<font color=\"green\">(如 1mbit)</font>"))
+e.placeholder = '1mbit'
+e.default = '1mbit'
+e.rmempty = true
+
+e = t:option(Value, "timestart", translate("起控时间"))
+e.placeholder = '00:00'
+e.default = '00:00'
+e.validate = validate_time
+e.rmempty = true
+
+e = t:option(Value, "timeend", translate("停控时间"))
+e.placeholder = '00:00'
+e.default = '00:00'
+e.validate = validate_time
+e.rmempty = true
+
+week=t:option(Value,"week",translate("Week Day"))
+week.rmempty = true
+week:value('*',translate("Everyday"))
+week:value(7,translate("Sunday"))
+week:value(1,translate("Monday"))
+week:value(2,translate("Tuesday"))
+week:value(3,translate("Wednesday"))
+week:value(4,translate("Thursday"))
+week:value(5,translate("Friday"))
+week:value(6,translate("Saturday"))
+week.default='*'
+
 a.apply_on_parse = true
 
 function a.on_after_commit(self)
