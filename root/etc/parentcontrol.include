@@ -1,8 +1,8 @@
 [ -x /etc/init.d/parentcontrol ] || chmod 755 /etc/init.d/parentcontrol
 if [ "$(uci -q get parentcontrol.@basic[0].enabled)" = "1" ]; then
-    logger -t parentcontrol "apply hook: invoking init.d start"
-/etc/init.d/parentcontrol start
+    logger -t parentcontrol "firewall hook: reloading rules"
+    /etc/init.d/parentcontrol reload
 else
-    logger -t parentcontrol "apply hook: invoking init.d stop"
-/etc/init.d/parentcontrol stop
+    logger -t parentcontrol "firewall hook: service disabled"
+    /etc/init.d/parentcontrol stop
 fi

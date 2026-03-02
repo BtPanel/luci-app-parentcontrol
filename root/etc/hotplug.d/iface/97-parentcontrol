@@ -4,4 +4,5 @@ CONFIG=parentcontrol
 [ "$ACTION" = "ifup" ] || exit 0
 [ "$(uci -q get $CONFIG.@basic[0].enabled)" = "1" ] || exit 0
 
-/etc/init.d/parentcontrol start
+# Use reload (lightweight) instead of start to avoid rebuilding cron on every ifup
+/etc/init.d/parentcontrol reload

@@ -2,16 +2,21 @@
 # ParentControl - nftables fw4 version (cron for time control)
 
 START=98
+STOP=15
 CONFIG=parentcontrol
 LOG_DIR=/tmp/parentcontrol
 LOG_FILE=$LOG_DIR/$CONFIG.log
 LOCK=/tmp/lock/${CONFIG}.lock
+STATE_FILE=$LOG_DIR/rules_state
 nft=$(command -v nft)
-TIME_FILTER=0
+[ -z "$nft" ] && nft="/usr/sbin/nft"
 NOW_MIN=0
 NOW_WEEK=0
+NOW_H=0
+NOW_M=0
 
-EXTRA_COMMANDS="block_time unblock_time block_speed unblock_speed"
+EXTRA_COMMANDS="status"
+EXTRA_HELP="        status  Show service status"
 
 elog() {
     mkdir -p "$LOG_DIR"
@@ -20,7 +25,11 @@ elog() {
 }
 
 clean_log() {
-    [ -f "$LOG_FILE" ] && [ "$(wc -l < "$LOG_FILE")" -gt 500 ] && elog "clear log ."
+    [ -f "$LOG_FILE" ] && [ "$(wc -l < "$LOG_FILE")" -gt 500 ] && {
+        tail -100 "$LOG_FILE" > "$LOG_FILE.tmp"
+        mv "$LOG_FILE.tmp" "$LOG_FILE"
+        elog "log trimmed"
+    }
 }
 
 in_week() {
@@ -34,21 +43,13 @@ in_week() {
 }
 
 time_match() {
-    # 参数：start end week now_min now_week
     local start="$1" end="$2" week="$3" now_min="$4" now_week="$5"
-
-    # 星期不匹配
     in_week "$week" "$now_week" || return 1
-
-    # 无时间段 -> 视为匹配
     [ -z "$start" ] && [ -z "$end" ] && return 0
-
-    # 仅 start 或仅 end：不严控，视为匹配
     [ -z "$start" ] || [ -z "$end" ] && return 0
 
     local sh sm eh em s e
     sh=${start%:*}; sm=${start#*:}; eh=${end%:*}; em=${end#*:}
-    # 基本校验，防止算术错误
     [ -z "$sh" ] || [ -z "$sm" ] || [ -z "$eh" ] || [ -z "$em" ] && return 1
     sh=${sh#0}; sm=${sm#0}; eh=${eh#0}; em=${em#0}
     [ -z "$sh" ] && sh=0; [ -z "$sm" ] && sm=0; [ -z "$eh" ] && eh=0; [ -z "$em" ] && em=0
@@ -56,250 +57,263 @@ time_match() {
     e=$((eh * 60 + em))
 
     if [ "$e" -ge "$s" ]; then
-        # 同日区间
         [ "$now_min" -ge "$s" ] && [ "$now_min" -le "$e" ]
         return $?
     else
-        # 跨午夜区间，例如 23:00-06:00
+        # Cross-midnight range, e.g. 22:00-08:30
         [ "$now_min" -ge "$s" ] || [ "$now_min" -le "$e" ]
         return $?
     fi
 }
 
-# 生成/重建 cron：根据 time sections 写定时 block/unblock
-rebuild_cron() {
-    # 先移除旧的 parentcontrol 条目
-    sed -i '/# parentcontrol$/d;/\/etc\/init\.d\/parentcontrol \(\<block_time\>\|\<unblock_time\>\|\<block_speed\>\|\<unblock_speed\>\)/d' /etc/crontabs/root 2>/dev/null
-
-    cron_add() {
-        local hhmm="$1"; local week="$2"; local cmd="$3"
-        [ -z "$hhmm" ] && return
-        echo "${hhmm#*:} ${hhmm%:*} * * $week $cmd # parentcontrol" >> /etc/crontabs/root
-    }
-
-    # 根据各 section 的 timestart/timeend 生成 cron
-    for mode in time speed; do
-        for i in $(uci show "$CONFIG" | grep "=${mode}" | cut -d'[' -f2 | cut -d']' -f1); do
-            local enabled start end week
-            enabled=$(uci -q get $CONFIG.@$mode[$i].enable)
-            [ "x$enabled" != "x1" ] && continue
-
-            start=$(uci -q get $CONFIG.@$mode[$i].timestart)
-            end=$(uci -q get $CONFIG.@$mode[$i].timeend)
-            week=$(uci -q get $CONFIG.@$mode[$i].week)
-            [ -z "$week" ] && week="*"
-
-            # 有时间段才写 cron
-            if [ -n "$start" ] || [ -n "$end" ]; then
-                cron_add "$start" "$week" "/etc/init.d/parentcontrol block_$mode"
-                cron_add "$end"   "$week" "/etc/init.d/parentcontrol unblock_$mode"
-            fi
-        done
-    done
-
-    /etc/init.d/cron restart
+update_now() {
+    local h m
+    h=$(date +%H); m=$(date +%M)
+    h=${h#0}; m=${m#0}
+    [ -z "$h" ] && h=0; [ -z "$m" ] && m=0
+    NOW_H=$h; NOW_M=$m
+    NOW_MIN=$((h * 60 + m))
+    NOW_WEEK=$(date +%w)
+    [ "$NOW_WEEK" = "0" ] && NOW_WEEK=7
 }
 
-set_rules() {
-    mmode=$1
-    timed_only=$2   # "1" 仅加载有时间段的条目；"0" 仅加载常驻；空/其他表示全部
-
-    # 确保表和普通链存在
-    $nft add table inet fw4 2>/dev/null || true
-    case "$mmode" in
-        time)     $nft add chain inet fw4 parentcontrol_time 2>/dev/null || true ;;
-        speed)    $nft add chain inet fw4 parentcontrol_speed 2>/dev/null || true ;;
-    esac
-
-    # 挂载 jump 到 base chain（显式插入到链首，避免被后续 ACCEPT 提前放行）
-    case "$mmode" in
-        time)
-            $nft insert rule inet fw4 forward position 0 jump parentcontrol_time 2>/dev/null || \
-                $nft add rule inet fw4 forward jump parentcontrol_time 2>/dev/null
-        ;;
-        speed)
-            $nft insert rule inet fw4 forward position 0 jump parentcontrol_speed 2>/dev/null || \
-                $nft add rule inet fw4 forward jump parentcontrol_speed 2>/dev/null
-        ;;
-    esac
-
-    # 遍历配置，提取 section index
-    for i in $(uci show "$CONFIG" | grep "=${mmode}" | cut -d'[' -f2 | cut -d']' -f1); do
-        enabled=$(uci -q get $CONFIG.@$mmode[$i].enable)
-        [ "x$enabled" != "x1" ] && continue
-
-        start=$(uci -q get $CONFIG.@$mmode[$i].timestart)
-        stop=$(uci -q get $CONFIG.@$mmode[$i].timeend)
-
-        case "$timed_only" in
-            1)  [ -z "$start" ] && [ -z "$stop" ] && continue ;;
-            0)  [ -n "$start" ] || [ -n "$stop" ] || true; if [ -n "$start" ] || [ -n "$stop" ]; then continue; fi ;;
-        esac
-
-        # 需要按当前时间过滤的场景（定时条目 + TIME_FILTER=1 时）
-        if [ "$timed_only" = "1" ] && [ "$TIME_FILTER" = "1" ]; then
-            week=$(uci -q get $CONFIG.@$mmode[$i].week)
-            time_match "$start" "$stop" "$week" "$NOW_MIN" "$NOW_WEEK" || continue
-        fi
-
-        mac=$(uci -q get $CONFIG.@$mmode[$i].mac)
-        MAC_EXPR=""
-        [ -n "$mac" ] && MAC_EXPR="ether saddr $mac"
-
-        case "$mmode" in
-            time)
-                # 兼容 ImmortalWrt 24.10：优先使用 device，其次 ifname，缺省 br-lan
-                lan_if=$(uci -q get network.lan.device)
-                [ -z "$lan_if" ] && lan_if=$(uci -q get network.lan.ifname)
-                [ -z "$lan_if" ] && lan_if="br-lan"
-                INF_EXPR="meta iifname \"$lan_if\""
-                # 仅阻断链，具体启停由 cron 驱动 block/unblock
-                $nft add rule inet fw4 parentcontrol_time $INF_EXPR $MAC_EXPR counter reject 2>/dev/null
-                elog "time-chain rule loaded: mac=$mac timed_only=$timed_only"
-            ;;
-            speed)
-                rate=$(uci -q get $CONFIG.@$mmode[$i].rate); [ -z "$rate" ] && rate="1mbit"
-                # 限速规则：超过速率则 drop
-                $nft add rule inet fw4 parentcontrol_speed $MAC_EXPR limit rate $rate counter drop 2>/dev/null
-                elog "speed-chain rule loaded: mac=$mac rate=$rate timed_only=$timed_only"
-            ;;
-        esac
+flush_conntrack() {
+    command -v conntrack >/dev/null 2>&1 && conntrack -F 2>/dev/null
+    local ft
+    for ft in $($nft list flowtables inet fw4 2>/dev/null | awk '/flowtable /{print $2}'); do
+        $nft flush flowtable inet fw4 "$ft" 2>/dev/null
     done
+}
+
+remove_jump_rules() {
+    local target_chain="$1" base_chain="${2:-forward}"
+    local h
+    for h in $($nft -a list chain inet fw4 "$base_chain" 2>/dev/null \
+                | grep "jump $target_chain" | sed 's/.*# handle //'); do
+        $nft delete rule inet fw4 "$base_chain" handle "$h" 2>/dev/null
+    done
+}
+
+setup_chains() {
+    local control_mode
+    control_mode=$(uci -q get $CONFIG.@basic[0].control_mode)
+    [ -z "$control_mode" ] && control_mode=0
+
+    $nft add table inet fw4 2>/dev/null || true
+    $nft add chain inet fw4 parentcontrol_time 2>/dev/null || true
+    $nft add chain inet fw4 parentcontrol_speed 2>/dev/null || true
+
+    local ch
+    for ch in parentcontrol_time parentcontrol_speed; do
+        remove_jump_rules "$ch" forward
+        $nft insert rule inet fw4 forward jump "$ch" 2>/dev/null
+    done
+
+    remove_jump_rules parentcontrol_time input
+    if [ "$control_mode" = "1" ]; then
+        $nft insert rule inet fw4 input jump parentcontrol_time 2>/dev/null
+    fi
 }
 
 del_rule() {
+    local ch
     for ch in parentcontrol_time parentcontrol_speed; do
-        $nft flush chain inet fw4 $ch 2>/dev/null
-        $nft delete chain inet fw4 $ch 2>/dev/null
+        remove_jump_rules "$ch" forward
+        remove_jump_rules "$ch" input
+    done
+    for ch in parentcontrol_time parentcontrol_speed; do
+        $nft flush chain inet fw4 "$ch" 2>/dev/null
+        $nft delete chain inet fw4 "$ch" 2>/dev/null
     done
 }
 
-# cron 调用入口：阻断时间链（开启时间段）
-block_time() {
-    # 仅刷新时间链，避免影响协议/网址链
-    $nft flush chain inet fw4 parentcontrol_time 2>/dev/null
-    # 当前时间（分钟）与星期
-    NOW_H=$(date +%H | sed 's/^0*//')
-    NOW_M=$(date +%M | sed 's/^0*//')
-    [ -z "$NOW_H" ] && NOW_H=0
-    [ -z "$NOW_M" ] && NOW_M=0
-    NOW_MIN=$((NOW_H*60 + NOW_M))
-    NOW_WEEK=$(date +%w)
-    [ "$NOW_WEEK" = "0" ] && NOW_WEEK=7   # 周日兼容
-    TIME_FILTER=1
-    set_rules time 0   # 常驻
-    set_rules time 1   # 定时且在当前时间窗口内
-    TIME_FILTER=0
-    # 清理已有连接和可能的 flowtable 加速，避免旧连接继续穿透
-    if command -v conntrack >/dev/null 2>&1; then
-        conntrack -F 2>/dev/null
+# Compute a string representing which rules should be active now
+# Used to detect state changes and avoid unnecessary conntrack flushes
+compute_rules_state() {
+    local state="" idx mmode
+    for mmode in time speed; do
+        idx=0
+        while uci -q get "$CONFIG.@${mmode}[$idx]" >/dev/null 2>&1; do
+            local enabled tstart tstop week mac
+            enabled=$(uci -q get "$CONFIG.@${mmode}[$idx].enable")
+            if [ "$enabled" = "1" ]; then
+                tstart=$(uci -q get "$CONFIG.@${mmode}[$idx].timestart")
+                tstop=$(uci -q get "$CONFIG.@${mmode}[$idx].timeend")
+                week=$(uci -q get "$CONFIG.@${mmode}[$idx].week")
+                mac=$(uci -q get "$CONFIG.@${mmode}[$idx].mac")
+
+                local active=1
+                if [ -n "$tstart" ] && [ -n "$tstop" ]; then
+                    time_match "$tstart" "$tstop" "$week" "$NOW_MIN" "$NOW_WEEK" || active=0
+                fi
+
+                if [ "$active" = "1" ]; then
+                    case "$mmode" in
+                        time)  state="${state}T${idx}:${mac:-ALL};" ;;
+                        speed)
+                            local rate
+                            rate=$(uci -q get "$CONFIG.@${mmode}[$idx].rate")
+                            state="${state}S${idx}:${mac:-ALL}:${rate:-1mbit};"
+                        ;;
+                    esac
+                fi
+            fi
+            idx=$((idx + 1))
+        done
+    done
+    echo "$state"
+}
+
+# Load nft rules for all currently-active entries
+load_active_rules() {
+    local mmode="$1" idx=0
+    local lan_if
+    if [ "$mmode" = "time" ]; then
+        lan_if=$(uci -q get network.lan.device)
+        [ -z "$lan_if" ] && lan_if=$(uci -q get network.lan.ifname)
+        [ -z "$lan_if" ] && lan_if="br-lan"
     fi
-    $nft reset flowtable inet fw4 2>/dev/null
-    touch "$LOCK"
-    elog "cron: block_time executed (time rules active)"
+
+    while uci -q get "$CONFIG.@${mmode}[$idx]" >/dev/null 2>&1; do
+        local enabled tstart tstop week mac
+        enabled=$(uci -q get "$CONFIG.@${mmode}[$idx].enable")
+        if [ "$enabled" = "1" ]; then
+            tstart=$(uci -q get "$CONFIG.@${mmode}[$idx].timestart")
+            tstop=$(uci -q get "$CONFIG.@${mmode}[$idx].timeend")
+            week=$(uci -q get "$CONFIG.@${mmode}[$idx].week")
+
+            local active=1
+            if [ -n "$tstart" ] && [ -n "$tstop" ]; then
+                time_match "$tstart" "$tstop" "$week" "$NOW_MIN" "$NOW_WEEK" || active=0
+            fi
+
+            if [ "$active" = "1" ]; then
+                mac=$(uci -q get "$CONFIG.@${mmode}[$idx].mac")
+                local MAC_EXPR=""
+                [ -n "$mac" ] && MAC_EXPR="ether saddr $mac"
+
+                case "$mmode" in
+                    time)
+                        local INF_EXPR="meta iifname \"$lan_if\""
+                        $nft add rule inet fw4 parentcontrol_time $INF_EXPR $MAC_EXPR counter reject 2>/dev/null
+                        elog "time+ mac=${mac:-ALL} [$tstart-$tstop w=${week:-*}]"
+                    ;;
+                    speed)
+                        local rate
+                        rate=$(uci -q get "$CONFIG.@${mmode}[$idx].rate")
+                        [ -z "$rate" ] && rate="1mbit"
+                        $nft add rule inet fw4 parentcontrol_speed $MAC_EXPR limit rate over $rate counter drop 2>/dev/null
+                        elog "speed+ mac=${mac:-ALL} rate=$rate [$tstart-$tstop w=${week:-*}]"
+                    ;;
+                esac
+            fi
+        fi
+        idx=$((idx + 1))
+    done
 }
 
-# cron 调用入口：解除阻断（关闭时间段）
-unblock_time() {
-    $nft flush chain inet fw4 parentcontrol_time 2>/dev/null
-    set_rules time 0   # 仅恢复常驻规则
-    elog "cron: unblock_time executed (timed time rules removed, always rules kept)"
-    # 注意：不删除 LOCK，让整体服务仍视为“启动”状态
-}
-
-block_speed() {
-    $nft flush chain inet fw4 parentcontrol_speed 2>/dev/null
-    set_rules speed 0
-    set_rules speed 1
-    elog "cron: block_speed executed (speed rules active)"
-}
-
-unblock_speed() {
-    $nft flush chain inet fw4 parentcontrol_speed 2>/dev/null
-    set_rules speed 0
-    elog "cron: unblock_speed executed (timed speed rules removed, always rules kept)"
+# Single cron entry: reload every minute (reload is smart, skips if no change)
+rebuild_cron() {
+    sed -i '/# parentcontrol$/d' /etc/crontabs/root 2>/dev/null
+    echo "* * * * * /etc/init.d/parentcontrol reload # parentcontrol" >> /etc/crontabs/root
+    /etc/init.d/cron restart
 }
 
 start() {
-    # 只要 enabled=1，就进入“启动”状态（即使无规则）
+    local enabled
     enabled=$(uci -q get $CONFIG.@basic[0].enabled)
-    [ "x$enabled" = "x1" ] || exit 1
+    [ "$enabled" = "1" ] || { elog "start: disabled"; exit 1; }
 
-    # 建日志目录与 lock
     mkdir -p "$LOG_DIR"
     touch "$LOCK"
-    elog "parentcontrol service start requested"
+    elog "=== service start ==="
 
-    # 清理旧链，按配置加载“常驻”规则；定时规则交给 cron 触发 block_*
     del_rule
+    setup_chains
+    update_now
 
-    # 统计启用条目
-    allsum=$(grep -c "enable='1'" /etc/config/$CONFIG)
-    if [ "$allsum" -gt 0 ]; then
-        set_rules time 0
-        set_rules speed 0
-        elog "rules loaded according to config (enabled sections=$allsum; timed rules wait cron)"
-    else
-        elog "no enabled sections; started without active rules"
-    fi
+    load_active_rules time
+    load_active_rules speed
+    flush_conntrack
 
-    # 重建 cron（根据 time sections）
+    # Save initial state
+    compute_rules_state > "$STATE_FILE"
+    elog "started (now=$NOW_H:$NOW_M week=$NOW_WEEK)"
+
     rebuild_cron
-
     clean_log
 }
 
 stop() {
-    # 彻底关闭：删链、删 lock、删 cron
     del_rule
-    rm -f "$LOCK" 2>/dev/null
-    sed -i '/# parentcontrol$/d;/\/etc\/init\.d\/parentcontrol \(\<block_time\>\|\<unblock_time\>\|\<block_speed\>\|\<unblock_speed\>\)/d' /etc/crontabs/root 2>/dev/null
+    rm -f "$LOCK" "$STATE_FILE" 2>/dev/null
+    sed -i '/# parentcontrol$/d' /etc/crontabs/root 2>/dev/null
     /etc/init.d/cron restart
-    elog "parentcontrol service stopped (rules/chains/cron cleared)"
+    elog "=== service stopped ==="
 }
 
 reload() {
-    enabled=$(uci get parentcontrol.@basic[0].enabled 2>/dev/null)
-
-    if [ "$enabled" = "1" ]; then
-        start
-        # 立即激活规则（含定时条目），避免需手动 block_*
-        block_speed
-        block_time
-    else
+    local enabled
+    enabled=$(uci -q get $CONFIG.@basic[0].enabled)
+    if [ "$enabled" != "1" ]; then
         stop
+        return
     fi
+
+    mkdir -p "$LOG_DIR"
+    update_now
+
+    local new_state old_state
+    new_state=$(compute_rules_state)
+    old_state=$(cat "$STATE_FILE" 2>/dev/null)
+
+    # Fast path: no change → do nothing
+    if [ "$new_state" = "$old_state" ]; then
+        return 0
+    fi
+
+    # State changed: reload rules
+    setup_chains
+    $nft flush chain inet fw4 parentcontrol_time 2>/dev/null
+    $nft flush chain inet fw4 parentcontrol_speed 2>/dev/null
+
+    load_active_rules time
+    load_active_rules speed
+    flush_conntrack
+
+    echo "$new_state" > "$STATE_FILE"
+    touch "$LOCK"
+    elog "reload: rules changed (now=$NOW_H:$NOW_M week=$NOW_WEEK) [$new_state]"
 }
 
 status() {
+    local enabled
     enabled=$(uci -q get $CONFIG.@basic[0].enabled)
 
-    # 1. 配置未启用 → 一律 inactive
     if [ "$enabled" != "1" ]; then
-        echo "parentcontrol is inactive (disabled in config)"
+        echo "parentcontrol is inactive (disabled)"
         return 1
     fi
 
-    # 2. 没有 lock → inactive
     if [ ! -f "$LOCK" ]; then
-        echo "parentcontrol is inactive"
+        echo "parentcontrol is inactive (not started)"
         return 1
     fi
 
-    # 3. 有链 → running
-    if $nft list chain inet fw4 parentcontrol_time >/dev/null 2>&1 || \
-       $nft list chain inet fw4 parentcontrol_speed >/dev/null 2>&1; then
-        echo "parentcontrol is running (rules active)"
-        return 0
+    local time_rules=0 speed_rules=0
+    if $nft list chain inet fw4 parentcontrol_time >/dev/null 2>&1; then
+        time_rules=$($nft list chain inet fw4 parentcontrol_time 2>/dev/null | grep -c "reject")
+    fi
+    if $nft list chain inet fw4 parentcontrol_speed >/dev/null 2>&1; then
+        speed_rules=$($nft list chain inet fw4 parentcontrol_speed 2>/dev/null | grep -c "drop")
     fi
 
-    # 4. 无链但有 cron → running (等待触发)
-    if grep -q "# parentcontrol" /etc/crontabs/root 2>/dev/null; then
-        echo "parentcontrol is running (cron scheduled)"
-        return 0
+    if [ "$time_rules" -gt 0 ] || [ "$speed_rules" -gt 0 ]; then
+        echo "parentcontrol is running (time=$time_rules speed=$speed_rules)"
+    elif grep -q "# parentcontrol" /etc/crontabs/root 2>/dev/null; then
+        echo "parentcontrol is running (cron active, waiting for time window)"
+    else
+        echo "parentcontrol is started (no active rules)"
     fi
-
-    # 5. 有 lock，但无链、无 cron → started(no rules)
-    echo "parentcontrol is started (no rules)"
     return 0
 }
