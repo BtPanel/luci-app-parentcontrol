@@ -1,5 +1,6 @@
 #!/bin/sh /etc/rc.common
-# ParentControl - nftables fw4 version (cron for time control)
+# ParentControl - nftables fw4 version
+# Automatic time-based internet access control via 1-minute cron polling
 
 START=98
 STOP=15
@@ -14,6 +15,7 @@ NOW_MIN=0
 NOW_WEEK=0
 NOW_H=0
 NOW_M=0
+LAN_IF=""
 
 EXTRA_COMMANDS="status"
 EXTRA_HELP="        status  Show service status"
@@ -32,6 +34,12 @@ clean_log() {
     }
 }
 
+get_lan_if() {
+    LAN_IF=$(uci -q get network.lan.device)
+    [ -z "$LAN_IF" ] && LAN_IF=$(uci -q get network.lan.ifname)
+    [ -z "$LAN_IF" ] && LAN_IF="br-lan"
+}
+
 in_week() {
     local week_str="$1" day="$2"
     [ -z "$week_str" ] && return 0
@@ -47,7 +55,6 @@ time_match() {
     in_week "$week" "$now_week" || return 1
     [ -z "$start" ] && [ -z "$end" ] && return 0
     [ -z "$start" ] || [ -z "$end" ] && return 0
-
     local sh sm eh em s e
     sh=${start%:*}; sm=${start#*:}; eh=${end%:*}; em=${end#*:}
     [ -z "$sh" ] || [ -z "$sm" ] || [ -z "$eh" ] || [ -z "$em" ] && return 1
@@ -55,14 +62,10 @@ time_match() {
     [ -z "$sh" ] && sh=0; [ -z "$sm" ] && sm=0; [ -z "$eh" ] && eh=0; [ -z "$em" ] && em=0
     s=$((sh * 60 + sm))
     e=$((eh * 60 + em))
-
     if [ "$e" -ge "$s" ]; then
-        [ "$now_min" -ge "$s" ] && [ "$now_min" -le "$e" ]
-        return $?
+        [ "$now_min" -ge "$s" ] && [ "$now_min" -le "$e" ]; return $?
     else
-        # Cross-midnight range, e.g. 22:00-08:30
-        [ "$now_min" -ge "$s" ] || [ "$now_min" -le "$e" ]
-        return $?
+        [ "$now_min" -ge "$s" ] || [ "$now_min" -le "$e" ]; return $?
     fi
 }
 
@@ -75,6 +78,45 @@ update_now() {
     NOW_MIN=$((h * 60 + m))
     NOW_WEEK=$(date +%w)
     [ "$NOW_WEEK" = "0" ] && NOW_WEEK=7
+}
+
+# Convert user rate string to kbytes/second integer for nftables
+# Supported: 1kbit 100kbit 1mbit 0.1mbit 1gbit (bit-based)
+#            1kb 100kb 1mb 1gb (byte-based = KB/s MB/s GB/s)
+#            1024 (plain number = kbytes/second)
+parse_rate_kbytes() {
+    local raw="$1"
+    raw=$(echo "$raw" | tr -d ' ' | tr 'A-Z' 'a-z')
+    local num unit
+    num=$(echo "$raw" | sed 's/[^0-9.]//g')
+    unit=$(echo "$raw" | sed 's/[0-9.]//g')
+    [ -z "$num" ] && num=1
+    [ -z "$unit" ] && unit="mbit"
+    echo "$num $unit" | awk '{
+        num = $1 + 0; unit = $2
+        if      (unit == "bit" || unit == "bps")   kb = num / 8 / 1024
+        else if (unit == "kbit" || unit == "kbps")  kb = num * 1000 / 8 / 1024
+        else if (unit == "mbit" || unit == "mbps")  kb = num * 1000000 / 8 / 1024
+        else if (unit == "gbit" || unit == "gbps")  kb = num * 1000000000 / 8 / 1024
+        else if (unit == "b")                       kb = num / 1024
+        else if (unit == "kb")                      kb = num
+        else if (unit == "mb")                      kb = num * 1024
+        else if (unit == "gb")                      kb = num * 1024 * 1024
+        else                                        kb = num * 1000000 / 8 / 1024
+        if (kb < 1) kb = 1
+        printf "%d\n", kb
+    }'
+}
+
+# Resolve IPv4/IPv6 addresses for a MAC from the neighbor table
+resolve_mac_ips() {
+    local mac="$1" dev="$2"
+    ip neigh show dev "$dev" 2>/dev/null \
+        | grep -i "$mac" \
+        | grep -v "FAILED\|INCOMPLETE" \
+        | awk '{print $1}' \
+        | grep -v "^fe80" \
+        | sort
 }
 
 flush_conntrack() {
@@ -98,17 +140,14 @@ setup_chains() {
     local control_mode
     control_mode=$(uci -q get $CONFIG.@basic[0].control_mode)
     [ -z "$control_mode" ] && control_mode=0
-
     $nft add table inet fw4 2>/dev/null || true
     $nft add chain inet fw4 parentcontrol_time 2>/dev/null || true
     $nft add chain inet fw4 parentcontrol_speed 2>/dev/null || true
-
     local ch
     for ch in parentcontrol_time parentcontrol_speed; do
         remove_jump_rules "$ch" forward
         $nft insert rule inet fw4 forward jump "$ch" 2>/dev/null
     done
-
     remove_jump_rules parentcontrol_time input
     if [ "$control_mode" = "1" ]; then
         $nft insert rule inet fw4 input jump parentcontrol_time 2>/dev/null
@@ -127,97 +166,162 @@ del_rule() {
     done
 }
 
-# Compute a string representing which rules should be active now
-# Used to detect state changes and avoid unnecessary conntrack flushes
+# Compute state fingerprint — includes resolved IPs so DHCP changes trigger refresh
 compute_rules_state() {
-    local state="" idx mmode
-    for mmode in time speed; do
-        idx=0
-        while uci -q get "$CONFIG.@${mmode}[$idx]" >/dev/null 2>&1; do
-            local enabled tstart tstop week mac
-            enabled=$(uci -q get "$CONFIG.@${mmode}[$idx].enable")
-            if [ "$enabled" = "1" ]; then
-                tstart=$(uci -q get "$CONFIG.@${mmode}[$idx].timestart")
-                tstop=$(uci -q get "$CONFIG.@${mmode}[$idx].timeend")
-                week=$(uci -q get "$CONFIG.@${mmode}[$idx].week")
-                mac=$(uci -q get "$CONFIG.@${mmode}[$idx].mac")
+    local state="" idx
+    get_lan_if
 
-                local active=1
-                if [ -n "$tstart" ] && [ -n "$tstop" ]; then
-                    time_match "$tstart" "$tstop" "$week" "$NOW_MIN" "$NOW_WEEK" || active=0
-                fi
+    # Time rules state
+    idx=0
+    while uci -q get "$CONFIG.@time[$idx]" >/dev/null 2>&1; do
+        local enabled tstart tstop week mac
+        enabled=$(uci -q get "$CONFIG.@time[$idx].enable")
+        if [ "$enabled" = "1" ]; then
+            tstart=$(uci -q get "$CONFIG.@time[$idx].timestart")
+            tstop=$(uci -q get "$CONFIG.@time[$idx].timeend")
+            week=$(uci -q get "$CONFIG.@time[$idx].week")
+            mac=$(uci -q get "$CONFIG.@time[$idx].mac")
+            local active=1
+            [ -n "$tstart" ] && [ -n "$tstop" ] && {
+                time_match "$tstart" "$tstop" "$week" "$NOW_MIN" "$NOW_WEEK" || active=0
+            }
+            [ "$active" = "1" ] && state="${state}T${idx}:${mac:-ALL};"
+        fi
+        idx=$((idx + 1))
+    done
 
-                if [ "$active" = "1" ]; then
-                    case "$mmode" in
-                        time)  state="${state}T${idx}:${mac:-ALL};" ;;
-                        speed)
-                            local rate
-                            rate=$(uci -q get "$CONFIG.@${mmode}[$idx].rate")
-                            state="${state}S${idx}:${mac:-ALL}:${rate:-1mbit};"
-                        ;;
-                    esac
-                fi
+    # Speed rules state (include resolved IPs for download direction)
+    idx=0
+    while uci -q get "$CONFIG.@speed[$idx]" >/dev/null 2>&1; do
+        local enabled tstart tstop week mac rate
+        enabled=$(uci -q get "$CONFIG.@speed[$idx].enable")
+        if [ "$enabled" = "1" ]; then
+            tstart=$(uci -q get "$CONFIG.@speed[$idx].timestart")
+            tstop=$(uci -q get "$CONFIG.@speed[$idx].timeend")
+            week=$(uci -q get "$CONFIG.@speed[$idx].week")
+            mac=$(uci -q get "$CONFIG.@speed[$idx].mac")
+            rate=$(uci -q get "$CONFIG.@speed[$idx].rate")
+            local active=1
+            [ -n "$tstart" ] && [ -n "$tstop" ] && {
+                time_match "$tstart" "$tstop" "$week" "$NOW_MIN" "$NOW_WEEK" || active=0
+            }
+            if [ "$active" = "1" ]; then
+                local ips=""
+                [ -n "$mac" ] && ips=$(resolve_mac_ips "$mac" "$LAN_IF" | tr '\n' ',')
+                state="${state}S${idx}:${mac:-ALL}:${rate:-1mbit}:${ips};"
             fi
-            idx=$((idx + 1))
-        done
+        fi
+        idx=$((idx + 1))
     done
     echo "$state"
 }
 
-# Load nft rules for all currently-active entries
-load_active_rules() {
-    local mmode="$1" idx=0
-    local lan_if
-    if [ "$mmode" = "time" ]; then
-        lan_if=$(uci -q get network.lan.device)
-        [ -z "$lan_if" ] && lan_if=$(uci -q get network.lan.ifname)
-        [ -z "$lan_if" ] && lan_if="br-lan"
-    fi
-
-    while uci -q get "$CONFIG.@${mmode}[$idx]" >/dev/null 2>&1; do
+# Load time-blocking rules into nftables
+load_time_rules() {
+    get_lan_if
+    local idx=0
+    while uci -q get "$CONFIG.@time[$idx]" >/dev/null 2>&1; do
         local enabled tstart tstop week mac
-        enabled=$(uci -q get "$CONFIG.@${mmode}[$idx].enable")
+        enabled=$(uci -q get "$CONFIG.@time[$idx].enable")
         if [ "$enabled" = "1" ]; then
-            tstart=$(uci -q get "$CONFIG.@${mmode}[$idx].timestart")
-            tstop=$(uci -q get "$CONFIG.@${mmode}[$idx].timeend")
-            week=$(uci -q get "$CONFIG.@${mmode}[$idx].week")
-
+            tstart=$(uci -q get "$CONFIG.@time[$idx].timestart")
+            tstop=$(uci -q get "$CONFIG.@time[$idx].timeend")
+            week=$(uci -q get "$CONFIG.@time[$idx].week")
             local active=1
-            if [ -n "$tstart" ] && [ -n "$tstop" ]; then
+            [ -n "$tstart" ] && [ -n "$tstop" ] && {
                 time_match "$tstart" "$tstop" "$week" "$NOW_MIN" "$NOW_WEEK" || active=0
-            fi
-
+            }
             if [ "$active" = "1" ]; then
-                mac=$(uci -q get "$CONFIG.@${mmode}[$idx].mac")
+                mac=$(uci -q get "$CONFIG.@time[$idx].mac")
+                local INF_EXPR="meta iifname \"$LAN_IF\""
                 local MAC_EXPR=""
                 [ -n "$mac" ] && MAC_EXPR="ether saddr $mac"
-
-                case "$mmode" in
-                    time)
-                        local INF_EXPR="meta iifname \"$lan_if\""
-                        $nft add rule inet fw4 parentcontrol_time $INF_EXPR $MAC_EXPR counter reject 2>/dev/null
-                        elog "time+ mac=${mac:-ALL} [$tstart-$tstop w=${week:-*}]"
-                    ;;
-                    speed)
-                        local rate
-                        rate=$(uci -q get "$CONFIG.@${mmode}[$idx].rate")
-                        [ -z "$rate" ] && rate="1mbit"
-                        $nft add rule inet fw4 parentcontrol_speed $MAC_EXPR limit rate over $rate counter drop 2>/dev/null
-                        elog "speed+ mac=${mac:-ALL} rate=$rate [$tstart-$tstop w=${week:-*}]"
-                    ;;
-                esac
+                $nft add rule inet fw4 parentcontrol_time $INF_EXPR $MAC_EXPR counter reject 2>/dev/null
+                elog "time+ mac=${mac:-ALL} [$tstart-$tstop w=${week:-*}]"
             fi
         fi
         idx=$((idx + 1))
     done
 }
 
-# Single cron entry: reload every minute (reload is smart, skips if no change)
+# Load speed-limiting rules into nftables (bidirectional: upload + download)
+load_speed_rules() {
+    get_lan_if
+    local idx=0
+    local IIF_EXPR="meta iifname \"$LAN_IF\""
+    local OIF_EXPR="meta oifname \"$LAN_IF\""
+
+    while uci -q get "$CONFIG.@speed[$idx]" >/dev/null 2>&1; do
+        local enabled tstart tstop week mac rate
+        enabled=$(uci -q get "$CONFIG.@speed[$idx].enable")
+        if [ "$enabled" = "1" ]; then
+            tstart=$(uci -q get "$CONFIG.@speed[$idx].timestart")
+            tstop=$(uci -q get "$CONFIG.@speed[$idx].timeend")
+            week=$(uci -q get "$CONFIG.@speed[$idx].week")
+            local active=1
+            [ -n "$tstart" ] && [ -n "$tstop" ] && {
+                time_match "$tstart" "$tstop" "$week" "$NOW_MIN" "$NOW_WEEK" || active=0
+            }
+            if [ "$active" = "1" ]; then
+                mac=$(uci -q get "$CONFIG.@speed[$idx].mac")
+                rate=$(uci -q get "$CONFIG.@speed[$idx].rate")
+                [ -z "$rate" ] && rate="1mbit"
+
+                local kbytes=$(parse_rate_kbytes "$rate")
+                local burst=$((kbytes > 64 ? kbytes : 64))
+                local LIMIT_EXPR="limit rate over $kbytes kbytes/second burst $burst kbytes"
+
+                if [ -n "$mac" ]; then
+                    # === Upload direction (client -> internet): match source MAC ===
+                    $nft add rule inet fw4 parentcontrol_speed \
+                        $IIF_EXPR ether saddr $mac $LIMIT_EXPR counter drop 2>/dev/null
+                    elog "speed+ UP mac=$mac rate=$rate (${kbytes}kB/s)"
+
+                    # === Download direction (internet -> client): match dest IP ===
+                    local ip
+                    for ip in $(resolve_mac_ips "$mac" "$LAN_IF"); do
+                        case "$ip" in
+                            *:*) # IPv6
+                                $nft add rule inet fw4 parentcontrol_speed \
+                                    $OIF_EXPR ip6 daddr $ip $LIMIT_EXPR counter drop 2>/dev/null
+                                elog "speed+ DOWN6 ip=$ip rate=$rate (${kbytes}kB/s)"
+                            ;;
+                            *) # IPv4
+                                $nft add rule inet fw4 parentcontrol_speed \
+                                    $OIF_EXPR ip daddr $ip $LIMIT_EXPR counter drop 2>/dev/null
+                                elog "speed+ DOWN ip=$ip rate=$rate (${kbytes}kB/s)"
+                            ;;
+                        esac
+                    done
+
+                    # If no IPs resolved, log warning (upload still works)
+                    local ip_count
+                    ip_count=$(resolve_mac_ips "$mac" "$LAN_IF" | wc -l)
+                    [ "$ip_count" -eq 0 ] && elog "WARN: no IP for mac=$mac, download not limited"
+                else
+                    # === All clients: limit total bandwidth on LAN interface ===
+                    # Upload
+                    $nft add rule inet fw4 parentcontrol_speed \
+                        $IIF_EXPR $LIMIT_EXPR counter drop 2>/dev/null
+                    # Download
+                    $nft add rule inet fw4 parentcontrol_speed \
+                        $OIF_EXPR $LIMIT_EXPR counter drop 2>/dev/null
+                    elog "speed+ ALL rate=$rate (${kbytes}kB/s)"
+                fi
+            fi
+        fi
+        idx=$((idx + 1))
+    done
+}
+
+# Single cron entry: reload every minute
 rebuild_cron() {
     sed -i '/# parentcontrol$/d' /etc/crontabs/root 2>/dev/null
     echo "* * * * * /etc/init.d/parentcontrol reload # parentcontrol" >> /etc/crontabs/root
     /etc/init.d/cron restart
 }
+
+# === Standard rc.common commands ===
 
 start() {
     local enabled
@@ -232,11 +336,10 @@ start() {
     setup_chains
     update_now
 
-    load_active_rules time
-    load_active_rules speed
+    load_time_rules
+    load_speed_rules
     flush_conntrack
 
-    # Save initial state
     compute_rules_state > "$STATE_FILE"
     elog "started (now=$NOW_H:$NOW_M week=$NOW_WEEK)"
 
@@ -252,6 +355,7 @@ stop() {
     elog "=== service stopped ==="
 }
 
+# Called every minute by cron — fast no-op when nothing changed
 reload() {
     local enabled
     enabled=$(uci -q get $CONFIG.@basic[0].enabled)
@@ -267,7 +371,7 @@ reload() {
     new_state=$(compute_rules_state)
     old_state=$(cat "$STATE_FILE" 2>/dev/null)
 
-    # Fast path: no change → do nothing
+    # Fast path: no change
     if [ "$new_state" = "$old_state" ]; then
         return 0
     fi
@@ -277,29 +381,26 @@ reload() {
     $nft flush chain inet fw4 parentcontrol_time 2>/dev/null
     $nft flush chain inet fw4 parentcontrol_speed 2>/dev/null
 
-    load_active_rules time
-    load_active_rules speed
+    load_time_rules
+    load_speed_rules
     flush_conntrack
 
     echo "$new_state" > "$STATE_FILE"
     touch "$LOCK"
-    elog "reload: rules changed (now=$NOW_H:$NOW_M week=$NOW_WEEK) [$new_state]"
+    elog "reload: state changed (now=$NOW_H:$NOW_M w=$NOW_WEEK) [$new_state]"
 }
 
 status() {
     local enabled
     enabled=$(uci -q get $CONFIG.@basic[0].enabled)
-
     if [ "$enabled" != "1" ]; then
         echo "parentcontrol is inactive (disabled)"
         return 1
     fi
-
     if [ ! -f "$LOCK" ]; then
         echo "parentcontrol is inactive (not started)"
         return 1
     fi
-
     local time_rules=0 speed_rules=0
     if $nft list chain inet fw4 parentcontrol_time >/dev/null 2>&1; then
         time_rules=$($nft list chain inet fw4 parentcontrol_time 2>/dev/null | grep -c "reject")
@@ -307,7 +408,6 @@ status() {
     if $nft list chain inet fw4 parentcontrol_speed >/dev/null 2>&1; then
         speed_rules=$($nft list chain inet fw4 parentcontrol_speed 2>/dev/null | grep -c "drop")
     fi
-
     if [ "$time_rules" -gt 0 ] || [ "$speed_rules" -gt 0 ]; then
         echo "parentcontrol is running (time=$time_rules speed=$speed_rules)"
     elif grep -q "# parentcontrol" /etc/crontabs/root 2>/dev/null; then

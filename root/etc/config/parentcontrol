@@ -3,21 +3,39 @@ config basic
 	option enabled '0'
 
 config time
-	option timestart '00:00'
-	option week '*'
-	option timeend '23:59'
 	option enable '0'
+	option timestart '00:00'
+	option timeend '00:00'
+	option week '1,2,3,4,5'
 
 config time
-	option timestart '00:00'
 	option enable '0'
-	option week '1,2,3,4,5'
-	option timeend '23:59'
+	option timestart '22:00'
+	option timeend '08:30'
+	option week '*'
+
+config time
+	option enable '0'
+	option timestart '00:00'
+	option timeend '00:00'
+	option week '6'
+
+config time
+	option enable '0'
+	option timestart '00:00'
+	option timeend '00:00'
+	option week '1,5'
 
 config speed
-	option rate '1mbit'
-	option timestart '00:00'
-	option timeend '23:59'
-	option week '*'
 	option enable '0'
+	option rate '1kb'
+	option timestart '20:00'
+	option timeend '07:00'
+	option week '*'
 
+config speed
+	option enable '0'
+	option rate '1mb'
+	option timestart '00:00'
+	option timeend '00:00'
+	option week '1,2,3,4,5'
