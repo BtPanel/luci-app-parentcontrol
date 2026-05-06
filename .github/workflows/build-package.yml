@@ -38,6 +38,7 @@ jobs:
           ARCH_PATH: ${{ matrix.path }}
           SDK_NAME: ${{ matrix.sdk_name }}
         run: |
+          # 修正域名并确保变量正确引用
           SDK_URL="https://openwrt.org{ARCH_PATH}/openwrt-sdk-24.10.0-${SDK_NAME}.tar.xz"
           echo "Downloading from $SDK_URL"
           curl -L "$SDK_URL" | tar -xJ --strip-components=1
@@ -55,6 +56,7 @@ jobs:
       - name: Get Package Version
         id: get_version
         run: |
+          # 提取版本号，默认 1.0
           V=$(grep "PKG_VERSION:=" package/luci-app-parentcontrol/Makefile | cut -d '=' -f2 | xargs)
           V=${V:-1.0}
           echo "version=$V" >> $GITHUB_OUTPUT
@@ -76,7 +78,7 @@ jobs:
           zip -j "v${VERSION}_${ARCH}.zip" release_files/*.ipk
 
       - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/artifact@v4
         with:
           name: zip-${{ matrix.arch }}
           path: "*.zip"
