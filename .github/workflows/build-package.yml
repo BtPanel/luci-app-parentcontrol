@@ -1,6 +1,5 @@
 name: Build and Release luci-app-parentcontrol
 
-# 触发条件：push 到 main 分支或者 PR 合并到 main
 on:
   push:
     branches:
@@ -12,89 +11,90 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      SDK_VERSION: "23.05.4"
-      ARCH: "x86/64"
+      SDK_URL: "https://downloads.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+      SDK_DIR: "openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64"
       APP_NAME: "luci-app-parentcontrol"
 
     steps:
       # 1. 检出代码
-      - name: 检出代码
+      - name: Checkout code
         uses: actions/checkout@v3
 
-      # 2. 安装构建依赖
-      - name: 安装依赖
+      # 2. 安装依赖
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libncurses5-dev zlib1g-dev gawk git gettext libssl-dev xsltproc rsync unzip file curl
+          sudo apt-get install -y build-essential libncurses5-dev zlib1g-dev gawk git gettext libssl-dev xsltproc rsync unzip file curl zstd
 
-      # 3. 下载 OpenWrt SDK
-      - name: 下载 OpenWrt SDK
+      # 3. 下载并解压 SDK
+      - name: Download and extract OpenWrt SDK
         run: |
-          wget https://downloads.openwrt.org/releases/${SDK_VERSION}/targets/${ARCH}/openwrt-sdk-${SDK_VERSION}-${ARCH}_gcc-12.3.0_musl.Linux-x86_64.tar.xz
-          tar -xf openwrt-sdk-${SDK_VERSION}-${ARCH}_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+          wget $SDK_URL
+          unzstd -c ${SDK_DIR}.tar.zst | tar -x
+          ls -l $SDK_DIR
 
       # 4. 拷贝 LuCI App 和语言包到 SDK
-      - name: 拷贝 LuCI App 和语言包
+      - name: Copy LuCI app to SDK
         run: |
-          cp -r $GITHUB_WORKSPACE ./openwrt-sdk-${SDK_VERSION}-${ARCH}_gcc-12.3.0_musl.Linux-x86_64/package/
+          cp -r $GITHUB_WORKSPACE ./$SDK_DIR/package/
 
       # 5. 更新 feeds
-      - name: 更新 feeds
+      - name: Update and install feeds
         run: |
-          cd openwrt-sdk-${SDK_VERSION}-${ARCH}_gcc-12.3.0_musl.Linux-x86_64
+          cd $SDK_DIR
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
       # 6. 编译主插件
-      - name: 编译主插件
+      - name: Build main app
         run: |
-          cd openwrt-sdk-${SDK_VERSION}-${ARCH}_gcc-12.3.0_musl.Linux-x86_64
+          cd $SDK_DIR
           make package/${APP_NAME}/compile V=s
 
       # 7. 编译中文语言包
-      - name: 编译中文语言包
+      - name: Build Chinese language pack
         run: |
-          cd openwrt-sdk-${SDK_VERSION}-${ARCH}_gcc-12.3.0_musl.Linux-x86_64
-          make package/${APP_NAME}-luci-i18n-zh-cn/compile V=s || echo "语言包可能不存在，继续流程"
+          cd $SDK_DIR
+          make package/${APP_NAME}-luci-i18n-zh-cn/compile V=s || echo "Language pack may not exist, continuing"
 
       # 8. 收集生成的 ipk
-      - name: 收集生成的 ipk
+      - name: Collect generated ipk
         run: |
-          cd openwrt-sdk-${SDK_VERSION}-${ARCH}_gcc-12.3.0_musl.Linux-x86_64/bin/packages
+          cd $SDK_DIR/bin/packages
           mkdir -p $GITHUB_WORKSPACE/output
           find . -name "${APP_NAME}_*.ipk" -exec cp {} $GITHUB_WORKSPACE/output/ \;
           find . -name "${APP_NAME}-luci-i18n-zh-cn_*.ipk" -exec cp {} $GITHUB_WORKSPACE/output/ \;
 
-      # 9. 获取版本号（第一次 1.0，以后自动递增）
-      - name: 设置版本号
+      # 9. 设置版本号（第一次 1.0，后续递增 patch）
+      - name: Set version
         id: version
         run: |
-          # 如果是第一次 release 默认 1.0
           TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-          echo "上次 tag: $TAG"
+          echo "Last tag: $TAG"
           if [ "$TAG" = "v0.0.0" ]; then
             VERSION="1.0"
           else
-            # 自动递增 patch 版本
             IFS='.' read -r MAJOR MINOR PATCH <<< "${TAG#v}"
             PATCH=$((PATCH+1))
             VERSION="${MAJOR}.${MINOR}.${PATCH}"
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      # 10. 创建 Release 并上传 ipk
-      - name: 创建 Release 并上传 ipk
+      # 10. 创建 Release
+      - name: Create GitHub Release
+        id: create_release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: v${{ steps.version.outputs.version }}
           name: v${{ steps.version.outputs.version }}
-          body: "Release ${{ steps.version.outputs.version }} - 包含主插件和中文语言包"
+          body: "Release v${{ steps.version.outputs.version }} - 主插件和中文语言包"
           draft: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 上传 ipk 到 Release
+      # 11. 上传 ipk 文件到 Release
+      - name: Upload IPKs to Release
         uses: actions/upload-release-asset@v1
         with:
           upload_url: ${{ steps.create_release.outputs.upload_url }}
