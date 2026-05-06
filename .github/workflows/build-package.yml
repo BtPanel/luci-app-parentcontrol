@@ -34,11 +34,9 @@ jobs:
           sudo apt-get install -y build-essential git libncurses5-dev libssl-dev python3-setuptools rsync unzip zlib1g-dev zip gawk
 
       - name: Download and Extract SDK
-        env:
-          ARCH_PATH: ${{ matrix.path }}
-          SDK_NAME: ${{ matrix.sdk_name }}
         run: |
-          SDK_URL="https://openwrt.org{ARCH_PATH}/openwrt-sdk-24.10.0-${SDK_NAME}.tar.xz"
+          # 直接在 run 中使用 GitHub Actions 的表达式语法，避免 Shell 变量引用错误
+          SDK_URL="https://openwrt.org{{ matrix.path }}/openwrt-sdk-24.10.0-${{ matrix.sdk_name }}.tar.xz"
           echo "Downloading from $SDK_URL"
           curl -L "$SDK_URL" | tar -xJ --strip-components=1
 
@@ -55,7 +53,6 @@ jobs:
       - name: Get Package Version
         id: get_version
         run: |
-          # 提取版本号，默认 1.0
           V=$(grep "PKG_VERSION:=" package/luci-app-parentcontrol/Makefile | cut -d '=' -f2 | xargs)
           V=${V:-1.0}
           echo "version=$V" >> $GITHUB_OUTPUT
@@ -102,7 +99,7 @@ jobs:
           name: Release ${{ github.ref_name || 'Manual Build' }}
           body: |
             ## ParentControl 自动编译版 (OpenWrt 24.10+)
-            - 包含主程序与简体中文包
+            - 包含多架构主程序与简体中文包
             - 适配 Firewall4 (nftables)
           draft: false
           prerelease: false
