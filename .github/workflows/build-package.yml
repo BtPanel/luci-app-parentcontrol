@@ -4,7 +4,7 @@ on:
   push:
     branches:
       - main
-  workflow_dispatch:  # 手动触发
+  workflow_dispatch:
 
 jobs:
   build:
@@ -14,6 +14,7 @@ jobs:
       SDK_URL: "https://downloads.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
       SDK_DIR: "openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64"
       APP_NAME: "luci-app-parentcontrol"
+      BUILD_DIR: "/tmp/openwrt-build"  # 临时构建目录，避免和仓库冲突
 
     steps:
       # 1. 检出代码
@@ -21,52 +22,59 @@ jobs:
         uses: actions/checkout@v3
 
       # 2. 安装依赖
-      - name: Install build dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential libncurses5-dev zlib1g-dev gawk git gettext libssl-dev xsltproc rsync unzip file curl zstd
 
-      # 3. 下载并解压 SDK
-      - name: Download and extract OpenWrt SDK
+      # 3. 创建独立构建目录
+      - name: Create build directory
         run: |
+          mkdir -p $BUILD_DIR
+          echo "Build directory: $BUILD_DIR"
+
+      # 4. 下载并解压 SDK 到独立目录
+      - name: Download and extract SDK
+        run: |
+          cd $BUILD_DIR
           wget $SDK_URL
           unzstd -c ${SDK_DIR}.tar.zst | tar -x
-          ls -l $SDK_DIR
+          ls -l $BUILD_DIR/$SDK_DIR
 
-      # 4. 拷贝 LuCI App 和语言包到 SDK
+      # 5. 拷贝 LuCI App 到 SDK package
       - name: Copy LuCI app to SDK
         run: |
-          mkdir -p ./$SDK_DIR/package/luci-app-parentcontrol
-          cp -r $GITHUB_WORKSPACE/* ./$SDK_DIR/package/luci-app-parentcontrol/
+          mkdir -p $BUILD_DIR/$SDK_DIR/package/$APP_NAME
+          # 拷贝仓库内容，但排除 SDK 文件夹
+          rsync -av --exclude=$SDK_DIR/ $GITHUB_WORKSPACE/ $BUILD_DIR/$SDK_DIR/package/$APP_NAME/
 
-      # 5. 更新 feeds
+      # 6. 更新 feeds
       - name: Update and install feeds
         run: |
-          cd $SDK_DIR
+          cd $BUILD_DIR/$SDK_DIR
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # 6. 编译主插件
+      # 7. 编译主插件
       - name: Build main app
         run: |
-          cd $SDK_DIR
+          cd $BUILD_DIR/$SDK_DIR
           make package/${APP_NAME}/compile V=s
 
-      # 7. 编译中文语言包
+      # 8. 编译中文语言包
       - name: Build Chinese language pack
         run: |
-          cd $SDK_DIR
+          cd $BUILD_DIR/$SDK_DIR
           make package/${APP_NAME}-luci-i18n-zh-cn/compile V=s || echo "Language pack may not exist, continuing"
 
-      # 8. 收集生成的 ipk
-      - name: Collect generated ipk
+      # 9. 收集 ipk
+      - name: Collect IPK files
         run: |
-          cd $SDK_DIR/bin/packages
           mkdir -p $GITHUB_WORKSPACE/output
-          find . -name "${APP_NAME}_*.ipk" -exec cp {} $GITHUB_WORKSPACE/output/ \;
-          find . -name "${APP_NAME}-luci-i18n-zh-cn_*.ipk" -exec cp {} $GITHUB_WORKSPACE/output/ \;
+          find $BUILD_DIR/$SDK_DIR/bin/packages -name "${APP_NAME}_*.ipk" -exec cp {} $GITHUB_WORKSPACE/output/ \;
+          find $BUILD_DIR/$SDK_DIR/bin/packages -name "${APP_NAME}-luci-i18n-zh-cn_*.ipk" -exec cp {} $GITHUB_WORKSPACE/output/ \;
 
-      # 9. 设置版本号
+      # 10. 设置版本号
       - name: Set version
         id: version
         run: |
@@ -81,7 +89,7 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version set to $VERSION"
 
-      # 10. 创建 Release
+      # 11. 创建 Release
       - name: Create GitHub Release
         id: create_release
         uses: softprops/action-gh-release@v1
@@ -94,7 +102,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 11. 上传 ipk 文件到 Release
+      # 12. 上传 ipk 文件到 Release
       - name: Upload IPKs to Release
         uses: actions/upload-release-asset@v1
         with:
