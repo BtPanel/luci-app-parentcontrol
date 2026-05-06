@@ -34,10 +34,14 @@ jobs:
           sudo apt-get install -y build-essential git libncurses5-dev libssl-dev python3-setuptools rsync unzip zlib1g-dev zip gawk
 
       - name: Download and Extract SDK
+        env:
+          # 将 matrix 变量安全地转换为 Shell 环境变量
+          M_PATH: ${{ matrix.path }}
+          M_SDK: ${{ matrix.sdk_name }}
         run: |
-          # 直接在 run 中使用 GitHub Actions 的表达式语法，避免 Shell 变量引用错误
-          SDK_URL="https://openwrt.org{{ matrix.path }}/openwrt-sdk-24.10.0-${{ matrix.sdk_name }}.tar.xz"
-          echo "Downloading from $SDK_URL"
+          # 在 Shell 中使用 $ 符号引用变量，并确保使用 downloads 域名
+          SDK_URL="https://openwrt.org{M_PATH}/openwrt-sdk-24.10.0-${M_SDK}.tar.xz"
+          echo "Target URL: $SDK_URL"
           curl -L "$SDK_URL" | tar -xJ --strip-components=1
 
       - name: Update and Install Feeds
@@ -99,8 +103,7 @@ jobs:
           name: Release ${{ github.ref_name || 'Manual Build' }}
           body: |
             ## ParentControl 自动编译版 (OpenWrt 24.10+)
-            - 包含多架构主程序与简体中文包
-            - 适配 Firewall4 (nftables)
+            - 包含主程序与简体中文包
           draft: false
           prerelease: false
           files: "*.zip"
