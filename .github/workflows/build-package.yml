@@ -1,109 +1,103 @@
-name: Build and Release Multi-Arch ZIPs
+name: Build and Release luci-app-parentcontrol
 
+# 触发条件：push 到 main 分支或者 PR 合并到 main
 on:
   push:
-    tags:
-      - "v*"
-  workflow_dispatch:
+    branches:
+      - main
+  workflow_dispatch:  # 手动触发
 
 jobs:
   build:
-    name: Build for ${{ matrix.arch }}
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            path: x86/64
-            sdk_name: x86-64_gcc-13.3.0_musl.Linux-x86_64
-          - arch: aarch64_generic
-            path: armsr/armv8
-            sdk_name: armsr-armv8_gcc-13.3.0_musl.Linux-x86_64
-          - arch: mipsel_24kc
-            path: ramips/mt7621
-            sdk_name: ramips-mt7621_gcc-13.3.0_musl.Linux-x86_64
+
+    env:
+      SDK_VERSION: "23.05.4"
+      ARCH: "x86/64"
+      APP_NAME: "luci-app-parentcontrol"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      # 1. 检出代码
+      - name: 检出代码
+        uses: actions/checkout@v3
 
-      - name: Initialization environment
+      # 2. 安装构建依赖
+      - name: 安装依赖
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential git libncurses5-dev libssl-dev python3-setuptools rsync unzip zlib1g-dev zip gawk
+          sudo apt-get install -y build-essential libncurses5-dev zlib1g-dev gawk git gettext libssl-dev xsltproc rsync unzip file curl
 
-      - name: Download and Extract SDK
-        env:
-          # 将 matrix 变量安全地转换为 Shell 环境变量
-          M_PATH: ${{ matrix.path }}
-          M_SDK: ${{ matrix.sdk_name }}
+      # 3. 下载 OpenWrt SDK
+      - name: 下载 OpenWrt SDK
         run: |
-          # 在 Shell 中使用 $ 符号引用变量，并确保使用 downloads 域名
-          SDK_URL="https://openwrt.org{M_PATH}/openwrt-sdk-24.10.0-${M_SDK}.tar.xz"
-          echo "Target URL: $SDK_URL"
-          curl -L "$SDK_URL" | tar -xJ --strip-components=1
+          wget https://downloads.openwrt.org/releases/${SDK_VERSION}/targets/${ARCH}/openwrt-sdk-${SDK_VERSION}-${ARCH}_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+          tar -xf openwrt-sdk-${SDK_VERSION}-${ARCH}_gcc-12.3.0_musl.Linux-x86_64.tar.xz
 
-      - name: Update and Install Feeds
+      # 4. 拷贝 LuCI App 和语言包到 SDK
+      - name: 拷贝 LuCI App 和语言包
         run: |
+          cp -r $GITHUB_WORKSPACE ./openwrt-sdk-${SDK_VERSION}-${ARCH}_gcc-12.3.0_musl.Linux-x86_64/package/
+
+      # 5. 更新 feeds
+      - name: 更新 feeds
+        run: |
+          cd openwrt-sdk-${SDK_VERSION}-${ARCH}_gcc-12.3.0_musl.Linux-x86_64
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Add Package to SDK
+      # 6. 编译主插件
+      - name: 编译主插件
         run: |
-          mkdir -p package/luci-app-parentcontrol
-          cp -r $GITHUB_WORKSPACE/* package/luci-app-parentcontrol/
+          cd openwrt-sdk-${SDK_VERSION}-${ARCH}_gcc-12.3.0_musl.Linux-x86_64
+          make package/${APP_NAME}/compile V=s
 
-      - name: Get Package Version
-        id: get_version
+      # 7. 编译中文语言包
+      - name: 编译中文语言包
         run: |
-          V=$(grep "PKG_VERSION:=" package/luci-app-parentcontrol/Makefile | cut -d '=' -f2 | xargs)
-          V=${V:-1.0}
-          echo "version=$V" >> $GITHUB_OUTPUT
+          cd openwrt-sdk-${SDK_VERSION}-${ARCH}_gcc-12.3.0_musl.Linux-x86_64
+          make package/${APP_NAME}-luci-i18n-zh-cn/compile V=s || echo "语言包可能不存在，继续流程"
 
-      - name: Configure and Compile
+      # 8. 收集生成的 ipk
+      - name: 收集生成的 ipk
         run: |
-          make defconfig
-          echo "CONFIG_PACKAGE_luci-app-parentcontrol=m" >> .config
-          echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
-          make defconfig
-          make package/luci-app-parentcontrol/compile V=s
+          cd openwrt-sdk-${SDK_VERSION}-${ARCH}_gcc-12.3.0_musl.Linux-x86_64/bin/packages
+          mkdir -p $GITHUB_WORKSPACE/output
+          find . -name "${APP_NAME}_*.ipk" -exec cp {} $GITHUB_WORKSPACE/output/ \;
+          find . -name "${APP_NAME}-luci-i18n-zh-cn_*.ipk" -exec cp {} $GITHUB_WORKSPACE/output/ \;
 
-      - name: Pack to ZIP
+      # 9. 获取版本号（第一次 1.0，以后自动递增）
+      - name: 设置版本号
+        id: version
         run: |
-          mkdir -p release_files
-          VERSION=${{ steps.get_version.outputs.version }}
-          ARCH=${{ matrix.arch }}
-          find bin/packages/ -name "luci-app-parentcontrol*.ipk" -exec cp {} release_files/ \;
-          zip -j "v${VERSION}_${ARCH}.zip" release_files/*.ipk
+          # 如果是第一次 release 默认 1.0
+          TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "上次 tag: $TAG"
+          if [ "$TAG" = "v0.0.0" ]; then
+            VERSION="1.0"
+          else
+            # 自动递增 patch 版本
+            IFS='.' read -r MAJOR MINOR PATCH <<< "${TAG#v}"
+            PATCH=$((PATCH+1))
+            VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Upload Artifact
-        uses: actions/upload-artifact@v4
+      # 10. 创建 Release 并上传 ipk
+      - name: 创建 Release 并上传 ipk
+        uses: softprops/action-gh-release@v1
         with:
-          name: zip-${{ matrix.arch }}
-          path: "*.zip"
-
-  release:
-    name: Create Release and Upload
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: .
-          merge-multiple: true
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name || 'latest' }}
-          name: Release ${{ github.ref_name || 'Manual Build' }}
-          body: |
-            ## ParentControl 自动编译版 (OpenWrt 24.10+)
-            - 包含主程序与简体中文包
+          tag_name: v${{ steps.version.outputs.version }}
+          name: v${{ steps.version.outputs.version }}
+          body: "Release ${{ steps.version.outputs.version }} - 包含主插件和中文语言包"
           draft: false
           prerelease: false
-          files: "*.zip"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 上传 ipk 到 Release
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./output
+          asset_name: parentcontrol-ipks.zip
+          asset_content_type: application/zip
