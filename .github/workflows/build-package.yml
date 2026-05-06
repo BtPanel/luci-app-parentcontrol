@@ -71,3 +71,10 @@ jobs:
       # 9. 显示输出文件列表
       - name: List output files
         run: ls -l $GITHUB_WORKSPACE/output
+
+      # 10. 上传 IPK 文件作为 artifact
+      - name: Upload IPK files as artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: parentcontrol-ipks
+          path: ./output
