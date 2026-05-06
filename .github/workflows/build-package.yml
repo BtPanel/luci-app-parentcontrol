@@ -30,13 +30,15 @@ jobs:
       - name: Download and extract OpenWrt SDK
         run: |
           wget $SDK_URL
+          mkdir -p $SDK_DIR
           unzstd -c ${SDK_DIR}.tar.zst | tar -x
           ls -l $SDK_DIR
 
-      # 4. 拷贝 LuCI App 和语言包到 SDK
+      # 4. 拷贝 LuCI App 和语言包到 SDK（修正拷贝路径，避免报错）
       - name: Copy LuCI app to SDK
         run: |
-          cp -r $GITHUB_WORKSPACE ./$SDK_DIR/package/
+          mkdir -p ./$SDK_DIR/package
+          cp -r $GITHUB_WORKSPACE/luci-app-parentcontrol ./$SDK_DIR/package/
 
       # 5. 更新 feeds
       - name: Update and install feeds
