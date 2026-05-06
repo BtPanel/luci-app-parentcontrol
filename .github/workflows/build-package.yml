@@ -15,11 +15,14 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            sdk_url: https://openwrt.org
+            path: x86/64
+            sdk_name: x86-64_gcc-13.3.0_musl.Linux-x86_64
           - arch: aarch64_generic
-            sdk_url: https://openwrt.org
+            path: armsr/armv8
+            sdk_name: armsr-armv8_gcc-13.3.0_musl.Linux-x86_64
           - arch: mipsel_24kc
-            sdk_url: https://openwrt.org
+            path: ramips/mt7621
+            sdk_name: ramips-mt7621_gcc-13.3.0_musl.Linux-x86_64
 
     steps:
       - name: Checkout
@@ -28,12 +31,14 @@ jobs:
       - name: Initialization environment
         run: |
           sudo apt-get update
-          # 修复 python3-distutils 缺失问题
-          sudo apt-get install -y build-essential git libncurses5-dev libssl-dev python3-setuptools rsync unzip zlib1g-dev zip
+          sudo apt-get install -y build-essential git libncurses5-dev libssl-dev python3-setuptools rsync unzip zlib1g-dev zip gawk
 
       - name: Download and Extract SDK
         run: |
-          curl -L ${{ matrix.sdk_url }} | tar -xJ --strip-components=1
+          # 拼接真实的 SDK 下载地址
+          SDK_URL="https://openwrt.org{{ matrix.path }}/openwrt-sdk-24.10.0-${{ matrix.sdk_name }}.tar.xz"
+          echo "Downloading from $SDK_URL"
+          curl -L $SDK_URL | tar -xJ --strip-components=1
 
       - name: Update and Install Feeds
         run: |
@@ -42,12 +47,14 @@ jobs:
 
       - name: Add Package to SDK
         run: |
+          # 将当前仓库代码放入 SDK 的 package 目录
           mkdir -p package/luci-app-parentcontrol
           cp -r $GITHUB_WORKSPACE/* package/luci-app-parentcontrol/
 
       - name: Get Package Version
         id: get_version
         run: |
+          # 从 Makefile 提取版本，若无则默认为 1.0
           V=$(grep "PKG_VERSION:=" package/luci-app-parentcontrol/Makefile | cut -d '=' -f2 | xargs)
           V=${V:-1.0}
           echo "version=$V" >> $GITHUB_OUTPUT
@@ -58,6 +65,7 @@ jobs:
           echo "CONFIG_PACKAGE_luci-app-parentcontrol=m" >> .config
           echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
           make defconfig
+          # 编译插件和语言包
           make package/luci-app-parentcontrol/compile V=s
 
       - name: Pack to ZIP
@@ -65,7 +73,11 @@ jobs:
           mkdir -p release_files
           VERSION=${{ steps.get_version.outputs.version }}
           ARCH=${{ matrix.arch }}
+          
+          # 收集编译好的 ipk 文件
           find bin/packages/ -name "luci-app-parentcontrol*.ipk" -exec cp {} release_files/ \;
+          
+          # 打包 ZIP：版本号+架构命名
           zip -j "v${VERSION}_${ARCH}.zip" release_files/*.ipk
 
       - name: Upload Artifact
@@ -94,7 +106,8 @@ jobs:
           name: Release ${{ github.ref_name || 'Manual Build' }}
           body: |
             ## ParentControl 自动编译版 (OpenWrt 24.10+)
-            - 包含多架构主程序与简体中文包
+            - 包含主程序与简体中文包
+            - 适配 Firewall4 (nftables)
           draft: false
           prerelease: false
           files: "*.zip"
