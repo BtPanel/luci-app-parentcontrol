@@ -14,7 +14,7 @@ jobs:
       SDK_URL: "https://downloads.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
       SDK_DIR: "openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64"
       APP_NAME: "luci-app-parentcontrol"
-      BUILD_DIR: "/tmp/openwrt-build"  # 临时构建目录，避免和仓库冲突
+      BUILD_DIR: "/tmp/openwrt-build"  # 独立构建目录，避免和仓库冲突
 
     steps:
       # 1. 检出代码
@@ -45,7 +45,7 @@ jobs:
       - name: Copy LuCI app to SDK
         run: |
           mkdir -p $BUILD_DIR/$SDK_DIR/package/$APP_NAME
-          # 拷贝仓库内容，但排除 SDK 文件夹
+          # 排除 SDK 文件夹，避免循环拷贝
           rsync -av --exclude=$SDK_DIR/ $GITHUB_WORKSPACE/ $BUILD_DIR/$SDK_DIR/package/$APP_NAME/
 
       # 6. 更新 feeds
@@ -55,17 +55,19 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # 7. 编译主插件
+      # 7. 编译主插件（非交互模式）
       - name: Build main app
         run: |
           cd $BUILD_DIR/$SDK_DIR
-          make package/${APP_NAME}/compile V=s
+          export TERM=dumb
+          make package/${APP_NAME}/compile V=s -j$(nproc)
 
-      # 8. 编译中文语言包
+      # 8. 编译中文语言包（非交互模式）
       - name: Build Chinese language pack
         run: |
           cd $BUILD_DIR/$SDK_DIR
-          make package/${APP_NAME}-luci-i18n-zh-cn/compile V=s || echo "Language pack may not exist, continuing"
+          export TERM=dumb
+          make package/${APP_NAME}-luci-i18n-zh-cn/compile V=s -j$(nproc) || echo "Language pack may not exist, continuing"
 
       # 9. 收集 ipk
       - name: Collect IPK files
