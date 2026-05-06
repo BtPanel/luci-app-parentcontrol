@@ -14,7 +14,7 @@ jobs:
       SDK_URL: "https://downloads.openwrt.org/releases/24.10.0/targets/x86/64/openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
       SDK_DIR: "openwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64"
       APP_NAME: "luci-app-parentcontrol"
-      BUILD_DIR: "/tmp/openwrt-build"  # 独立构建目录，避免和仓库冲突
+      BUILD_DIR: "/tmp/openwrt-build"
 
     steps:
       # 1. 检出代码
@@ -45,7 +45,6 @@ jobs:
       - name: Copy LuCI app to SDK
         run: |
           mkdir -p $BUILD_DIR/$SDK_DIR/package/$APP_NAME
-          # 排除 SDK 文件夹，避免循环拷贝
           rsync -av --exclude=$SDK_DIR/ $GITHUB_WORKSPACE/ $BUILD_DIR/$SDK_DIR/package/$APP_NAME/
 
       # 6. 更新 feeds
@@ -55,28 +54,26 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # 7. 编译主插件（非交互模式）
-      - name: Build main app
+      # 7. 编译主插件 + 中文语言包（非交互、单线程）
+      - name: Build main app and language pack
         run: |
           cd $BUILD_DIR/$SDK_DIR
           export TERM=dumb
-          make package/${APP_NAME}/compile V=s -j$(nproc)
+          # 生成默认 .config 避免 menuconfig
+          make defconfig
+          # 单线程编译主插件
+          make package/${APP_NAME}/compile V=s -j1
+          # 单线程编译语言包，若不存在也不报错
+          make package/${APP_NAME}-luci-i18n-zh-cn/compile V=s -j1 || true
 
-      # 8. 编译中文语言包（非交互模式）
-      - name: Build Chinese language pack
-        run: |
-          cd $BUILD_DIR/$SDK_DIR
-          export TERM=dumb
-          make package/${APP_NAME}-luci-i18n-zh-cn/compile V=s -j$(nproc) || echo "Language pack may not exist, continuing"
-
-      # 9. 收集 ipk
+      # 8. 收集 ipk
       - name: Collect IPK files
         run: |
           mkdir -p $GITHUB_WORKSPACE/output
           find $BUILD_DIR/$SDK_DIR/bin/packages -name "${APP_NAME}_*.ipk" -exec cp {} $GITHUB_WORKSPACE/output/ \;
           find $BUILD_DIR/$SDK_DIR/bin/packages -name "${APP_NAME}-luci-i18n-zh-cn_*.ipk" -exec cp {} $GITHUB_WORKSPACE/output/ \;
 
-      # 10. 设置版本号
+      # 9. 设置版本号
       - name: Set version
         id: version
         run: |
@@ -91,7 +88,7 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version set to $VERSION"
 
-      # 11. 创建 Release
+      # 10. 创建 Release
       - name: Create GitHub Release
         id: create_release
         uses: softprops/action-gh-release@v1
@@ -104,7 +101,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      # 12. 上传 ipk 文件到 Release
+      # 11. 上传 ipk 文件到 Release
       - name: Upload IPKs to Release
         uses: actions/upload-release-asset@v1
         with:
