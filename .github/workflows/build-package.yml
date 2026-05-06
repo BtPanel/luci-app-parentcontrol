@@ -1,4 +1,4 @@
-name: Build luci-app-parentcontrol IPK
+name: Build luci-app-parentcontrol IPK with Cache
 
 on:
   push:
@@ -27,13 +27,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libncurses5-dev zlib1g-dev gawk git gettext libssl-dev xsltproc rsync unzip file curl zstd
 
-      # 3. 创建独立构建目录
-      - name: Create build directory
-        run: mkdir -p $BUILD_DIR
+      # 3. 缓存 SDK
+      - name: Cache OpenWrt SDK
+        uses: actions/cache@v3
+        with:
+          path: ${{ env.BUILD_DIR }}/${{ env.SDK_DIR }}
+          key: sdk-${{ env.SDK_DIR }}
+          restore-keys: |
+            sdk-
 
-      # 4. 下载并解压 SDK
+      # 4. 下载 SDK（如果缓存没有）
       - name: Download and extract SDK
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
+          mkdir -p $BUILD_DIR
           cd $BUILD_DIR
           wget $SDK_URL
           unzstd -c ${SDK_DIR}.tar.zst | tar -x
@@ -45,14 +52,25 @@ jobs:
           mkdir -p $BUILD_DIR/$SDK_DIR/package/$APP_NAME
           rsync -av --exclude=$SDK_DIR/ $GITHUB_WORKSPACE/ $BUILD_DIR/$SDK_DIR/package/$APP_NAME/
 
-      # 6. 更新 feeds
+      # 6. 缓存 feeds
+      - name: Cache feeds
+        uses: actions/cache@v3
+        with:
+          path: ${{ env.BUILD_DIR }}/feeds
+          key: feeds-${{ hashFiles('**/Makefile') }}
+          restore-keys: |
+            feeds-
+
+      # 7. 更新 feeds（仅第一次或缓存失效）
       - name: Update and install feeds
         run: |
           cd $BUILD_DIR/$SDK_DIR
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+          # 保存 feeds 到缓存路径
+          cp -r feeds $BUILD_DIR/
 
-      # 7. 编译主插件 + 中文语言包（非交互，单线程）
+      # 8. 编译主插件 + 中文语言包（非交互，单线程）
       - name: Build main app and language pack
         run: |
           cd $BUILD_DIR/$SDK_DIR
@@ -61,20 +79,20 @@ jobs:
           make package/${APP_NAME}/compile V=s -j1
           make package/${APP_NAME}-luci-i18n-zh-cn/compile V=s -j1 || true
 
-      # 8. 收集 ipk
+      # 9. 收集 ipk
       - name: Collect IPK files
         run: |
           mkdir -p $GITHUB_WORKSPACE/output
           find $BUILD_DIR/$SDK_DIR/bin/packages -name "${APP_NAME}_*.ipk" -exec cp {} $GITHUB_WORKSPACE/output/ \;
           find $BUILD_DIR/$SDK_DIR/bin/packages -name "${APP_NAME}-luci-i18n-zh-cn_*.ipk" -exec cp {} $GITHUB_WORKSPACE/output/ \;
 
-      # 9. 显示输出文件列表
+      # 10. 显示输出文件列表
       - name: List output files
         run: ls -l $GITHUB_WORKSPACE/output
 
-      # 10. 上传 IPK 文件作为 artifact
+      # 11. 上传 IPK 文件作为 artifact (最新 v4)
       - name: Upload IPK files as artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: parentcontrol-ipks
           path: ./output
