@@ -28,7 +28,8 @@ jobs:
       - name: Initialization environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev zip
+          # 修复 python3-distutils 缺失问题
+          sudo apt-get install -y build-essential git libncurses5-dev libssl-dev python3-setuptools rsync unzip zlib1g-dev zip
 
       - name: Download and Extract SDK
         run: |
@@ -47,11 +48,9 @@ jobs:
       - name: Get Package Version
         id: get_version
         run: |
-          # 提取版本号，若不存在则默认 1.0
           V=$(grep "PKG_VERSION:=" package/luci-app-parentcontrol/Makefile | cut -d '=' -f2 | xargs)
           V=${V:-1.0}
           echo "version=$V" >> $GITHUB_OUTPUT
-          echo "Full version: $V"
 
       - name: Configure and Compile
         run: |
@@ -66,11 +65,7 @@ jobs:
           mkdir -p release_files
           VERSION=${{ steps.get_version.outputs.version }}
           ARCH=${{ matrix.arch }}
-          
-          # 查找生成的 IPK 文件（主包和语言包）并拷贝到临时目录
           find bin/packages/ -name "luci-app-parentcontrol*.ipk" -exec cp {} release_files/ \;
-          
-          # 打包为 ZIP：v版本号_架构.zip
           zip -j "v${VERSION}_${ARCH}.zip" release_files/*.ipk
 
       - name: Upload Artifact
@@ -89,7 +84,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: all_zips
+          path: .
           merge-multiple: true
 
       - name: Create GitHub Release
@@ -98,9 +93,8 @@ jobs:
           tag_name: ${{ github.ref_name || 'latest' }}
           name: Release ${{ github.ref_name || 'Manual Build' }}
           body: |
-            ## ParentControl 自动编译版
-            - 适配系统: OpenWrt 24.10+ (Firewall4/nftables)
-            - 包含主程序与简体中文语言包
+            ## ParentControl 自动编译版 (OpenWrt 24.10+)
+            - 包含多架构主程序与简体中文包
           draft: false
           prerelease: false
           files: "*.zip"
