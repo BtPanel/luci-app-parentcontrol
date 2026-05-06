@@ -1,0 +1,106 @@
+name: Build and Release Multi-Arch ZIPs
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build for ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            sdk_url: https://openwrt.org
+          - arch: aarch64_generic
+            sdk_url: https://openwrt.org
+          - arch: mipsel_24kc
+            sdk_url: https://openwrt.org
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialization environment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev zip
+
+      - name: Download and Extract SDK
+        run: |
+          curl -L ${{ matrix.sdk_url }} | tar -xJ --strip-components=1
+
+      - name: Update and Install Feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Add Package to SDK
+        run: |
+          mkdir -p package/luci-app-parentcontrol
+          cp -r $GITHUB_WORKSPACE/* package/luci-app-parentcontrol/
+
+      - name: Get Package Version
+        id: get_version
+        run: |
+          # 提取版本号，若不存在则默认 1.0
+          V=$(grep "PKG_VERSION:=" package/luci-app-parentcontrol/Makefile | cut -d '=' -f2 | xargs)
+          V=${V:-1.0}
+          echo "version=$V" >> $GITHUB_OUTPUT
+          echo "Full version: $V"
+
+      - name: Configure and Compile
+        run: |
+          make defconfig
+          echo "CONFIG_PACKAGE_luci-app-parentcontrol=m" >> .config
+          echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
+          make defconfig
+          make package/luci-app-parentcontrol/compile V=s
+
+      - name: Pack to ZIP
+        run: |
+          mkdir -p release_files
+          VERSION=${{ steps.get_version.outputs.version }}
+          ARCH=${{ matrix.arch }}
+          
+          # 查找生成的 IPK 文件（主包和语言包）并拷贝到临时目录
+          find bin/packages/ -name "luci-app-parentcontrol*.ipk" -exec cp {} release_files/ \;
+          
+          # 打包为 ZIP：v版本号_架构.zip
+          zip -j "v${VERSION}_${ARCH}.zip" release_files/*.ipk
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zip-${{ matrix.arch }}
+          path: "*.zip"
+
+  release:
+    name: Create Release and Upload
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_zips
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name || 'latest' }}
+          name: Release ${{ github.ref_name || 'Manual Build' }}
+          body: |
+            ## ParentControl 自动编译版
+            - 适配系统: OpenWrt 24.10+ (Firewall4/nftables)
+            - 包含主程序与简体中文语言包
+          draft: false
+          prerelease: false
+          files: "*.zip"
